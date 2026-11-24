@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint-type-security:
+    name: Lint, Typecheck & Security
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - name: Set up Python 3.12
+        run: uv python install 3.12
+      - name: Install dependencies
+        run: uv sync --frozen
+      - name: Check formatting (ruff format)
+        run: uv run ruff format --check src/ tests/
+      - name: Static lint (ruff check)
+        run: uv run ruff check src/ tests/
+      - name: Strict type check (mypy)
+        run: uv run mypy src/
+      - name: Security static scan (bandit)
+        run: uv run bandit -r src/ -c pyproject.toml -ll
+      - name: Verify package build (uv build)
+        run: uv build
+
+  test:
+    name: Test (${{ matrix.os }} / py${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python-version: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - name: Set up Python ${{ matrix.python-version }}
+        run: uv python install ${{ matrix.python-version }}
+      - name: Install dependencies
+        run: uv sync --python ${{ matrix.python-version }}
+      - name: Run full test suite (pytest)
+        run: uv run --python ${{ matrix.python-version }} pytest -v

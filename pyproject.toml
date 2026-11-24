@@ -1,0 +1,103 @@
+[project]
+name = "stream-memory-manager"
+version = "0.1.0"
+description = "Universal local-first AI context migrator, staging UI, and fail-closed Sandbar Stream MCP memory manager"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.12"
+keywords = [
+    "sandbar",
+    "sandbar-stream",
+    "mcp",
+    "model-context-protocol",
+    "ai-memory",
+    "context-migration",
+    "personal-knowledge-management",
+    "chatgpt",
+    "claude",
+    "gemini",
+    "coding-agents",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Intended Audience :: End Users/Desktop",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Utilities",
+    "Typing :: Typed",
+]
+dependencies = [
+    "keyring>=25.7.0",
+    "mcp==2.3.0",
+    "pydantic>=2.12.0",
+    "rich>=13.9.4",
+    "starlette>=0.46.0",
+    "typer>=0.16.0",
+    "uvicorn>=0.34.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/jerryj6/stream-memory-manager"
+Repository = "https://github.com/jerryj6/stream-memory-manager"
+Issues = "https://github.com/jerryj6/stream-memory-manager/issues"
+Documentation = "https://github.com/jerryj6/stream-memory-manager#readme"
+
+[project.scripts]
+stream-memory = "stream_memory_manager.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.10.0,<0.12.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "bandit>=1.8.0",
+    "hypothesis>=6.170.0",
+    "mypy>=1.14.0",
+    "pip-audit>=2.8.0",
+    "pytest>=8.3.0",
+    "pytest-asyncio>=0.25.0",
+    "ruff>=0.9.0",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+pythonpath = ["."]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+markers = [
+    "slow: scale and soak tests",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "S", "RUF"]
+ignore = ["S101", "B008", "E501", "RUF001"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["S105", "S106", "S108", "S311"]
+"src/stream_memory_manager/mock_server.py" = ["S105"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+plugins = ["pydantic.mypy"]
+mypy_path = "src"
+
+[tool.bandit]
+exclude_dirs = ["tests", ".venv"]
+skips = ["B101"]

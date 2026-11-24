@@ -1,0 +1,24 @@
+# Failure Mode & Effects Matrix
+
+Rather than claiming failure is impossible, every foreseeable failure mode is explicitly mapped to a deterministic containment mechanism and verified in automated tests.
+
+| Category | Failure Mode | Containment Mechanism | Resulting State / Exit Code | Recovery Path |
+| :--- | :--- | :--- | :--- | :--- |
+| **Network / Transport** | TCP drop / timeout AFTER server committed `create_note` | `REQUEST_IN_FLIGHT` persisted pre-send; `retries=0`; `max_redirects=0`; classified as `AmbiguousWriteError` | `UNCERTAIN_REMOTE_OUTCOME` / `ExitCode 7` | Run read-only `reconcile` -> adopts committed Log -> `VERIFIED` (0 duplicates) |
+| **Network / Transport** | Unrecognized HTTP 5xx, malformed JSON, or raw `isError=True` on write | Treated strictly as `AmbiguousWriteError` (never `FAILED_CONFIRMED`) | `UNCERTAIN_REMOTE_OUTCOME` / `ExitCode 7` | Read-only `reconcile` |
+| **Server Visibility** | Read-after-write indexing lag (`searchIndexStatus: pending` or temporary 404) | Bounded verification polling (`max_verification_attempts_per_op`) with monotonic sleeps; never re-dispatches write | `AWAITING_VERIFICATION` -> `VERIFIED` or `BLOCKED` / `ExitCode 6` | Run read-only `verify` later |
+| **Server Visibility** | Unresolvable ambiguity (committed Log hidden from all reads/searches) | `reconcile` finds 0 matches and refuses to guess or re-create | `BLOCKED` / `ExitCode 5` | Human inspects Stream app directly |
+| **Server Behavior** | Server corrupts body or returns wrong `id` | `normalized_payload_hash` and `id` mismatch check fails closed | `CONFLICTED` / `BLOCKED` / `ExitCode 5` | Inspect Stream app; never mark `VERIFIED` |
+| **Server Behavior** | Live MCP schema/tool drift after plan approval | Preflight `discover_capabilities()` compares SHA-256 `schema_fingerprint` | Plan `INVALIDATED` / `ExitCode 5` | Inspect `capabilities --live`; re-plan & re-approve |
+| **Server Behavior** | Pagination loop or `max_pages` overflow in `list_artifacts` | Adapter raises `StreamMemoryError` instead of returning truncated list | Aborts observation / `ExitCode 8` or `9` | Investigate folder size / server pagination |
+| **Auth / OAuth** | Access token expires mid-plan (before write) | Single-attempt validated refresh; if unsuccessful -> `PAUSED_AUTHORIZATION` | Plan `PAUSED` / `ExitCode 4` | `auth login` -> `resume` |
+| **Auth / OAuth** | Access token expires during post-write verification | Dedicated `PAUSED_VERIFICATION_AUTH` state (cannot reach `READY` or `CANCELLED_BEFORE_WRITE`) | Plan `PAUSED` / `ExitCode 4` | `auth login` -> `resume` verifies only (0 duplicates) |
+| **Auth / OAuth** | Wrong Sandbar account signed in before `apply`/`resume` | `AccountBindingManager` compares live `account_id` against bound plan | `AccountMismatchError` / `ExitCode 5` | Re-authenticate with original bound account |
+| **Auth / OAuth** | OS Keychain locked/unavailable | `SecureTokenStorage` fails closed (zero silent plaintext fallback) | `AuthorizationRequiredError` / `ExitCode 4` | Unlock Keychain or opt into `--file-token-store` |
+| **Rate Limits** | HTTP `429` or JSON rate-limit response | Honors `Retry-After` (never shortened); persists cooldown in SQLite; pauses after streak | `PAUSED_RATE_LIMIT` or `PAUSED_VERIFICATION_RATE_LIMIT` / `ExitCode 8` | Wait `cooldown_remaining_seconds` -> `resume` |
+| **User Content Safety** | Duplicate `Memory` folders exist in user account | Planning and preflight refuse to guess which folder to target | `BLOCKED` / `ExitCode 5` | User deduplicates folders in Stream app |
+| **User Content Safety** | Existing user-authored briefing or `Memory` folder instruction | Planner omits overwrite unless empty or manager-owned; `expected_last_update_ts` guards concurrent edits | Omitted cleanly or `CONFLICTED` / `ExitCode 5` | User reviews manually; unrelated content untouched |
+| **Privacy / Security** | Secret, PII, zero-width evasion, or prompt injection in source or metadata | NFKC + invisible-char normalized scan hard-blocks at ingest, privacy-review, compile, export, plan, and preflight | `EXCLUDED` / `PrivacyViolationError` / `ExitCode 2` | Strip sensitive content locally before re-ingesting |
+| **Local Storage** | Process crash (`SIGKILL`) at any boundary | SQLite WAL + `synchronous=FULL`; kernel releases `flock`; crash sweep on restart | Auto-recovers cleanly | Run `reconcile` (if uncertain) then `resume` |
+| **Local Storage** | Corrupted SQLite DB or invalid backup file | Header + `integrity_check` + checksum + schema table validation before touch | `DatabaseCorruptionError` / `ExitCode 9` | Restore verified backup per `DISASTER_RECOVERY.md` |
+| **Concurrency** | Two CLI processes target same remote account simultaneously | Exclusive non-blocking POSIX `flock` on `canonical_account_scope` | `LockContentionError` / `ExitCode 5` | Wait for active writer to finish; verify via `doctor` |

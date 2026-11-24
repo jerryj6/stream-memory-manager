@@ -1,0 +1,47 @@
+# Python / Virtualenvs
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+dist/
+build/
+
+# Sensitive Local Runtime State (NEVER commit personal data, DBs, tokens, or private reviews)
+data/
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+*.backup.json
+writer_*.lock
+backups/
+exports/
+private/
+local_complete_registry.json
+local_complete_registry.md
+.env
+.env.*
+*token*.json
+*credentials*.json
+*oauth*.json
+*.har
+*storageState*
+*private_appendix*
+*private-appendix*
+*private-review*
+*private_review*
+*Stream_Consolidated_Archive*
+*chatgpt_v2*
+*phase_two_final*
+
+# OS / Editor
+.DS_Store
+.vscode/
+.idea/
