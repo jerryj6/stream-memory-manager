@@ -1274,17 +1274,30 @@ def create_staging_ui_app(data_dir: Path) -> tuple[Starlette, str]:
             det = detect_local_sources()
             status = compute_system_status(db=db, mode=ExecutionMode.DRY_RUN, profile="default")
 
-            # Check OAuth connection read-only
-            storage = SecureTokenStorage(
-                profile="default",
-                server_url=SANDBAR_OFFICIAL_MCP_URL,
-                fallback_dir=data_dir / "credentials",
-                use_keyring=True,
-            )
-            tok = await storage.get_tokens()
+            # Check OAuth connection read-only (degrade cleanly on headless Linux without keyring)
+            tok = None
+            keyring_unavailable = False
+            try:
+                storage = SecureTokenStorage(
+                    profile="default",
+                    server_url=SANDBAR_OFFICIAL_MCP_URL,
+                    fallback_dir=data_dir / "credentials",
+                    use_keyring=True,
+                )
+                tok = await storage.get_tokens()
+            except StreamMemoryError:
+                keyring_unavailable = True
+                file_storage = SecureTokenStorage(
+                    profile="default",
+                    server_url=SANDBAR_OFFICIAL_MCP_URL,
+                    fallback_dir=data_dir / "credentials",
+                    use_keyring=False,
+                )
+                tok = await file_storage.get_tokens()
             auth_info = {
                 "connected": tok is not None,
                 "scope": tok.scope if tok else None,
+                "keyring_unavailable": keyring_unavailable,
             }
             return JSONResponse(
                 {

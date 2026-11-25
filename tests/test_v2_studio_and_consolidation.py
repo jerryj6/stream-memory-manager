@@ -287,3 +287,26 @@ def test_v2_studio_ui_collect_merge_and_safety_guards(tmp_path: Path) -> None:
         ).status_code
         == 400
     )
+
+
+def test_v2_studio_api_state_handles_missing_keyring(tmp_path: Path, monkeypatch: object) -> None:
+    """Headless Linux / CI environments without an OS keyring must not crash `/api/state`."""
+    import keyring
+    import keyring.errors
+
+    def _raise_no_keyring(*_args: object, **_kwargs: object) -> None:
+        raise keyring.errors.NoKeyringError("No recommended backend was available.")
+
+    assert hasattr(monkeypatch, "setattr")
+    monkeypatch.setattr(keyring, "get_password", _raise_no_keyring)
+
+    data_dir = tmp_path / "headless_studio"
+    Database(data_dir / "stream_memory.db").close()
+    app, _csrf = create_staging_ui_app(data_dir)
+    client = TestClient(app, base_url="http://127.0.0.1:4319")
+
+    resp = client.get("/api/state")
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert payload["auth"]["connected"] is False
+    assert payload["auth"]["keyring_unavailable"] is True
