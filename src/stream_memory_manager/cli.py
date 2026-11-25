@@ -1431,7 +1431,7 @@ def cmd_inspect_live(
                 scheduler=sched,
                 storage=storage,
                 allow_localhost_http=allow_localhost_http,
-                expected_mode=ExecutionMode.LIVE,
+                expected_mode=ExecutionMode.MOCK if allow_localhost_http else ExecutionMode.LIVE,
                 capabilities=CapabilityStore(db).get_latest(server_url),
             )
             managed_ids = db.list_managed_remote_ids()
@@ -1508,7 +1508,7 @@ def cmd_reset_memory(
                 scheduler=sched,
                 storage=storage,
                 allow_localhost_http=allow_localhost_http,
-                expected_mode=ExecutionMode.LIVE,
+                expected_mode=ExecutionMode.MOCK if allow_localhost_http else ExecutionMode.LIVE,
                 capabilities=CapabilityStore(db).get_latest(server_url),
             )
             target_ids: list[str] | None = None
@@ -1578,7 +1578,7 @@ def cmd_search_live(
                 scheduler=sched,
                 storage=storage,
                 allow_localhost_http=allow_localhost_http,
-                expected_mode=ExecutionMode.LIVE,
+                expected_mode=ExecutionMode.MOCK if allow_localhost_http else ExecutionMode.LIVE,
                 capabilities=CapabilityStore(db).get_latest(server_url),
             )
 
