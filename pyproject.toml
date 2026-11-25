@@ -1,7 +1,7 @@
 [project]
 name = "stream-memory-manager"
-version = "0.2.0"
-description = "Stream Memory Studio — local-first AI context consolidator, live Sandbar Stream monitor, and fail-closed MCP sync"
+version = "0.3.0"
+description = "Agent-driven context handoff, consolidation, live Sandbar Stream MCP sync, and Stream Web verification pipeline"
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]

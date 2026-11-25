@@ -31,7 +31,7 @@ uv run pytest -v
 ## 4. Key Modules & Docs
 
 - `src/stream_memory_manager/web_ui.py` — 4-tab **Stream Memory Studio** (`127.0.0.1`, CSRF-protected, SSE live monitor)
-- `src/stream_memory_manager/consolidator.py` — TF-IDF overlap detection, hygiene triage, deterministic merge, optional BYOK/Ollama Auto-Merge
+- `src/stream_memory_manager/consolidator.py` — TF-IDF overlap clusterer, hygiene triage, `agent-pack` handoff exporter, and atomic `apply-dossiers` writer (purely agent-driven; zero BYOK/Ollama)
 - `src/stream_memory_manager/harvesters.py` — 12 read-only local agent/repo harvesters + 8-platform premade Max-Thinking prompt kit (`STREAM_MEMORY_EXPORT v1`)
 - `src/stream_memory_manager/mcp_adapter.py` — Live-verified Sandbar Stream MCP client (block-array readback, float `lastUpdateUnixTs` quarantine to `Memory Archive`, live search)
 - `src/stream_memory_manager/compiler.py` — Voice-friendly `<= 900`-word semantic compiler & Briefing packer

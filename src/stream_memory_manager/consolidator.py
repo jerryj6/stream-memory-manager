@@ -12,8 +12,6 @@ import re
 from collections import Counter
 from typing import Any
 
-import httpx2
-
 from stream_memory_manager.compiler import count_words_dual
 from stream_memory_manager.models import (
     EVIDENCE_RANK,
@@ -26,7 +24,6 @@ from stream_memory_manager.models import (
     StreamMemoryError,
 )
 from stream_memory_manager.registry import KnowledgeRegistry
-from stream_memory_manager.security import redact_secrets
 
 STOPWORDS: frozenset[str] = frozenset(
     {
@@ -465,74 +462,273 @@ def merge_records(
     }
 
 
-async def auto_consolidate_with_llm(
-    records: list[dict[str, Any]],
+def build_agent_consolidation_pack(
+    registry: KnowledgeRegistry,
     *,
-    target_title: str,
-    base_url: str,
-    model: str,
-    api_key: str | None = None,
-    max_words: int = 820,
-) -> str:
-    """Optional opt-in BYOK / local Ollama consolidation of overlapping records into one dense dossier.
+    similarity_threshold: float = 0.24,
+) -> dict[str, Any]:
+    """Export a compact, agent-native handoff & overlap-cluster pack for the driving coding agent.
 
-    Compatible with any OpenAI-format `/v1/chat/completions` endpoint (OpenAI, OpenRouter,
-    local Ollama `http://localhost:11434/v1`, LM Studio, Apple MLX server).
+    Instead of calling external BYOK/Ollama APIs, the driving coding agent (Antigravity, Claude Code,
+    Codex, Cursor, OpenCode) uses its own full reasoning directly on this pack and writes back clean,
+    lossless 600-880 word Topic Dossiers via `stream-memory apply-dossiers`.
     """
-    clean_base = base_url.rstrip("/")
-    endpoint = (
-        clean_base if clean_base.endswith("/chat/completions") else f"{clean_base}/chat/completions"
+    analysis = analyze_corpus(
+        registry, similarity_threshold=similarity_threshold, max_suggestions=200
     )
-    source_blocks = "\n\n---\n\n".join(
-        f"### {r.get('title', 'Untitled')}\n{r.get('body', '')}" for r in records
-    )
-    system_prompt = (
-        "You consolidate overlapping personal & technical AI memory notes into ONE dense, "
-        "self-contained, naturally written dossier for Sandbar Stream voice & text retrieval. "
-        f"Target <= {max_words} words. Keep EVERY concrete fact, number, model name, project status, "
-        "preference, negative result, and caveat. Eliminate duplicate sentences, generic AI boilerplate, "
-        "and robotic [Confirmed]/[Constraint] tag prefixes. Separate built/verified work from proposed "
-        "designs. Never invent facts not present in the sources. Output ONLY the clean consolidated note body."
-    )
-    user_prompt = (
-        f"Target Dossier Title: {target_title}\n\nSource Notes to Consolidate:\n\n{source_blocks}"
-    )
+    active = [
+        r
+        for r in registry.list_records()
+        if str(r["status"]) not in (RecordStatus.SUPERSEDED.value, RecordStatus.ARCHIVED.value)
+        and str(r["inclusion_decision"]) != InclusionDecision.EXCLUDED.value
+    ]
+    rec_by_id = {str(r["logical_id"]): r for r in active}
+    hygiene = analysis["record_hygiene"]
 
-    headers = {"Content-Type": "application/json"}
-    if api_key and api_key.strip():
-        headers["Authorization"] = f"Bearer {api_key.strip()}"
+    # Group pairwise overlaps into connected-component clusters for clean agent batch synthesis
+    adj: dict[str, set[str]] = {lid: set() for lid in rec_by_id}
+    for s in analysis["merge_suggestions"]:
+        a = str(s["record_a"])
+        b = str(s["record_b"])
+        if a in adj and b in adj:
+            adj[a].add(b)
+            adj[b].add(a)
 
-    payload = {
-        "model": model.strip(),
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        "temperature": 0.2,
+    visited: set[str] = set()
+    clusters: list[dict[str, Any]] = []
+    for lid in rec_by_id:
+        if lid in visited or not adj[lid]:
+            continue
+        comp: list[str] = []
+        stack = [lid]
+        while stack:
+            cur = stack.pop()
+            if cur in visited:
+                continue
+            visited.add(cur)
+            comp.append(cur)
+            for nb in sorted(adj[cur]):
+                if nb not in visited:
+                    stack.append(nb)
+        comp.sort()
+        total_w = sum(
+            count_words_dual(str(rec_by_id[c]["title"]), str(rec_by_id[c]["body"]))[1] for c in comp
+        )
+        clusters.append(
+            {
+                "cluster_id": f"cluster_{len(clusters) + 1:02d}",
+                "record_ids": comp,
+                "titles": [str(rec_by_id[c]["title"]) for c in comp],
+                "categories": sorted({str(rec_by_id[c]["category"]) for c in comp}),
+                "raw_combined_words": total_w,
+                "needs_dedupe_tightening": total_w > 880,
+            }
+        )
+
+    records_payload = []
+    for r in active:
+        lid = str(r["logical_id"])
+        _, cw = count_words_dual(str(r["title"]), str(r["body"]))
+        records_payload.append(
+            {
+                "logical_id": lid,
+                "title": str(r["title"]),
+                "category": str(r["category"]),
+                "word_count": cw,
+                "hygiene_flags": hygiene.get(lid, []),
+                "body": str(r["body"]),
+            }
+        )
+
+    return {
+        "schema": "STREAM_AGENT_CONSOLIDATION_PACK v1",
+        "stats": {
+            "active_count": analysis["active_count"],
+            "total_words": analysis.get("total_words", 0),
+            "avg_words": analysis["avg_words"],
+            "sparse_count": analysis["sparse_count"],
+            "boilerplate_count": analysis["boilerplate_count"],
+            "overlap_cluster_count": len(clusters),
+        },
+        "target_guidelines": {
+            "target_dossier_count": "12-25 dense, self-contained Topic Dossiers",
+            "max_conservative_words_per_dossier": 880,
+            "voice_style": (
+                "Natural, direct prose and clean bullets. Strip robotic [Confirmed]/[Constraint] "
+                "prefixes and repeated AI meta-rules. Preserve 100% of concrete facts, exact model "
+                "numbers, versions, dates, negative results, NDA boundaries, and caveats."
+            ),
+        },
+        "overlap_clusters": clusters,
+        "records": records_payload,
+        "apply_schema_example": {
+            "dossiers": [
+                {
+                    "source_ids": ["id_primary", "id_overlap_1"],
+                    "title": "Unified Topic Dossier Title",
+                    "category": "ENGINEERING",
+                    "body": "Clean, lossless consolidated prose <= 880 words...",
+                }
+            ],
+            "retire_ids": [
+                {
+                    "logical_id": "id_redundant_meta",
+                    "superseded_by": "id_primary",
+                    "reason": "All unique rules folded into canonical Operating Instructions",
+                }
+            ],
+        },
     }
 
-    async with httpx2.AsyncClient(timeout=90.0) as client:
-        resp = await client.post(endpoint, headers=headers, json=payload)
-        if resp.status_code >= 400:
+
+def apply_agent_dossiers(
+    registry: KnowledgeRegistry,
+    payload: dict[str, Any],
+    *,
+    approve: bool = True,
+) -> dict[str, Any]:
+    """Atomically apply a driving coding agent's synthesized Topic Dossiers & retirements."""
+    dossiers = payload.get("dossiers")
+    retire_ids = payload.get("retire_ids") or []
+    if not isinstance(dossiers, list) or (not dossiers and not retire_ids):
+        raise StreamMemoryError(
+            "Consolidation payload must include a non-empty `dossiers` list (or `retire_ids`).",
+            error_class=ErrorClass.VALIDATION_PERMANENT,
+            exit_code=ExitCode.VALIDATION_ERROR,
+        )
+
+    before_active = [
+        r
+        for r in registry.list_records()
+        if str(r["status"]) not in (RecordStatus.SUPERSEDED.value, RecordStatus.ARCHIVED.value)
+        and str(r["inclusion_decision"]) != InclusionDecision.EXCLUDED.value
+    ]
+    before_count = len(before_active)
+
+    applied: list[dict[str, Any]] = []
+    oversized: list[dict[str, Any]] = []
+    touched_ids: set[str] = set()
+
+    for idx, item in enumerate(dossiers, start=1):
+        if not isinstance(item, dict):
             raise StreamMemoryError(
-                f"LLM consolidation endpoint returned HTTP {resp.status_code}: {redact_secrets(resp.text[:300])}",
-                error_class=ErrorClass.READ_TRANSIENT,
-                exit_code=ExitCode.TEMPORARY_FAILURE,
+                f"Dossier entry #{idx} must be a JSON object.",
+                error_class=ErrorClass.VALIDATION_PERMANENT,
+                exit_code=ExitCode.VALIDATION_ERROR,
             )
-        data = resp.json()
-        choices = data.get("choices") or []
-        if not choices:
+        src_ids = [str(s).strip() for s in (item.get("source_ids") or []) if str(s).strip()]
+        title = str(item.get("title") or "").strip()
+        category = str(item.get("category") or "").strip().upper() or None
+        raw_body = str(item.get("body") or "").strip()
+        if not src_ids or not title or not raw_body:
             raise StreamMemoryError(
-                "LLM consolidation returned no choices.",
-                error_class=ErrorClass.READ_TRANSIENT,
-                exit_code=ExitCode.TEMPORARY_FAILURE,
+                f"Dossier entry #{idx} requires non-empty `source_ids`, `title`, and `body`.",
+                error_class=ErrorClass.VALIDATION_PERMANENT,
+                exit_code=ExitCode.VALIDATION_ERROR,
             )
-        msg = choices[0].get("message") or {}
-        content = str(msg.get("content") or "").strip()
-        if not content:
+        clean_body = strip_robotic_tag_prefixes(raw_body).strip()
+        touched_ids.update(src_ids)
+
+        if len(src_ids) >= 2:
+            mres = merge_records(
+                registry,
+                src_ids,
+                target_title=title,
+                target_category=category,
+                merged_body=clean_body,
+                approve=approve,
+            )
+            entry_res = mres
+        else:
+            primary_id = src_ids[0]
+            rec = registry.get_record(primary_id)
+            if rec is None:
+                raise StreamMemoryError(
+                    f"Record not found in dossier #{idx}: {primary_id!r}",
+                    error_class=ErrorClass.VALIDATION_PERMANENT,
+                    exit_code=ExitCode.VALIDATION_ERROR,
+                )
+            final_cat = category or str(rec["category"]).upper()
+            registry.upsert_record(
+                MemoryRecordInput(
+                    logical_id=primary_id,
+                    title=title,
+                    category=final_cat,
+                    logical_group=str(rec.get("logical_group") or f"Consolidated ({final_cat})"),
+                    canonical_subject=title,
+                    body=clean_body,
+                    status=RecordStatus.ACTIVE,
+                    evidence_class=EvidenceClass(
+                        str(rec.get("evidence_class") or EvidenceClass.USER_CONFIRMED.value)
+                    ),
+                    effective_date=rec.get("effective_date"),
+                    observed_date=rec.get("observed_date"),
+                    last_confirmed_date=rec.get("last_confirmed_date"),
+                    source_refs=list(rec.get("source_refs") or []),
+                    source_hashes=list(rec.get("source_hashes") or []),
+                    search_aliases=list(rec.get("search_aliases") or []),
+                    inclusion_decision=(
+                        InclusionDecision.APPROVED if approve else InclusionDecision.PENDING_REVIEW
+                    ),
+                    destination_eligible=True,
+                )
+            )
+            ws, cons = count_words_dual(title, clean_body)
+            entry_res = {
+                "primary_id": primary_id,
+                "title": title,
+                "category": final_cat,
+                "absorbed_ids": [],
+                "word_count": ws,
+                "conservative_word_count": cons,
+                "fits_single_log": cons <= 900,
+            }
+
+        applied.append(entry_res)
+        if not entry_res["fits_single_log"]:
+            oversized.append(
+                {
+                    "primary_id": entry_res["primary_id"],
+                    "title": entry_res["title"],
+                    "conservative_word_count": entry_res["conservative_word_count"],
+                }
+            )
+
+    retired: list[str] = []
+    for r_item in retire_ids:
+        if not isinstance(r_item, dict):
+            continue
+        old_id = str(r_item.get("logical_id") or "").strip()
+        sup_by = str(r_item.get("superseded_by") or "").strip()
+        reason = str(r_item.get("reason") or "Retired during agent consolidation").strip()
+        if not old_id or not sup_by:
+            continue
+        if registry.get_record(old_id) is None or registry.get_record(sup_by) is None:
             raise StreamMemoryError(
-                "LLM consolidation returned empty content.",
-                error_class=ErrorClass.READ_TRANSIENT,
-                exit_code=ExitCode.TEMPORARY_FAILURE,
+                f"Invalid retirement reference: logical_id={old_id!r}, superseded_by={sup_by!r}",
+                error_class=ErrorClass.VALIDATION_PERMANENT,
+                exit_code=ExitCode.VALIDATION_ERROR,
             )
-        return redact_secrets(content)
+        registry.mark_superseded(old_id, sup_by, reason=reason)
+        retired.append(old_id)
+        touched_ids.add(old_id)
+
+    after_active = [
+        r
+        for r in registry.list_records()
+        if str(r["status"]) not in (RecordStatus.SUPERSEDED.value, RecordStatus.ARCHIVED.value)
+        and str(r["inclusion_decision"]) != InclusionDecision.EXCLUDED.value
+    ]
+    unmodified = [
+        str(r["logical_id"]) for r in after_active if str(r["logical_id"]) not in touched_ids
+    ]
+
+    return {
+        "before_active_count": before_count,
+        "after_active_count": len(after_active),
+        "dossiers_applied": len(applied),
+        "retired_count": len(retired),
+        "oversized_dossiers": oversized,
+        "unmodified_active_ids": unmodified,
+        "dossiers": applied,
+    }

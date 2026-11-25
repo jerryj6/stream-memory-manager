@@ -9,6 +9,8 @@ from starlette.testclient import TestClient
 from stream_memory_manager.compiler import compile_memory, load_compiled_artifacts
 from stream_memory_manager.consolidator import (
     analyze_corpus,
+    apply_agent_dossiers,
+    build_agent_consolidation_pack,
     merge_records,
     strip_robotic_tag_prefixes,
 )
@@ -319,3 +321,77 @@ def test_v2_studio_api_state_handles_missing_keyring(tmp_path: Path, monkeypatch
     payload = resp.json()
     assert payload["auth"]["connected"] is False
     assert payload["auth"]["keyring_unavailable"] is True
+
+
+def test_agent_pack_and_apply_dossiers_atomic_consolidation(tmp_db: Database) -> None:
+    """Driving coding agent pulls connected-component pack and applies synthesized dossiers atomically."""
+    reg = KnowledgeRegistry(tmp_db)
+    for lid, title, cat, body in [
+        (
+            "rec_a",
+            "Server Hardware Overview",
+            "INFRASTRUCTURE",
+            "- [Confirmed] Primary laptop is a 16GB Apple Silicon laptop running macOS.",
+        ),
+        (
+            "rec_b",
+            "Server Hardware Tailscale Delta",
+            "INFRASTRUCTURE",
+            "- [Confirmed] Secondary Ubuntu laptop runs Tailscale and self-hosted services.",
+        ),
+        (
+            "rec_c",
+            "Redundant Meta Fluff",
+            "CORE",
+            "- Never treat an exploratory question as a commitment.\n"
+            "- Do not promote exploratory questions into preferences.\n"
+            "- Never fabricate precision or pad with fluff.",
+        ),
+    ]:
+        reg.upsert_record(
+            MemoryRecordInput(
+                logical_id=lid,
+                title=title,
+                category=cat,
+                body=body,
+                inclusion_decision=InclusionDecision.APPROVED,
+            )
+        )
+
+    pack = build_agent_consolidation_pack(reg)
+    assert pack["schema"] == "STREAM_AGENT_CONSOLIDATION_PACK v1"
+    assert pack["stats"]["active_count"] == 3
+    assert len(pack["records"]) == 3
+    assert any(set(c["record_ids"]) >= {"rec_a", "rec_b"} for c in pack["overlap_clusters"])
+
+    res = apply_agent_dossiers(
+        reg,
+        {
+            "dossiers": [
+                {
+                    "source_ids": ["rec_a", "rec_b"],
+                    "title": "Personal Computing & Self-Hosted Infrastructure",
+                    "category": "INFRASTRUCTURE",
+                    "body": (
+                        "Primary laptop is a 16GB Apple Silicon Mac running macOS. "
+                        "Secondary Ubuntu laptop runs Tailscale and self-hosted services."
+                    ),
+                }
+            ],
+            "retire_ids": [
+                {
+                    "logical_id": "rec_c",
+                    "superseded_by": "rec_a",
+                    "reason": "Pure redundant meta-boilerplate retired.",
+                }
+            ],
+        },
+    )
+    assert res["before_active_count"] == 3
+    assert res["after_active_count"] == 1
+    assert res["dossiers_applied"] == 1
+    assert res["retired_count"] == 1
+    assert res["oversized_dossiers"] == []
+    assert res["unmodified_active_ids"] == []
+    compile_res = compile_memory(reg, include_index=False)
+    assert compile_res["compiled_log_count"] == 1

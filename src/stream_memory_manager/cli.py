@@ -25,7 +25,12 @@ from stream_memory_manager.capabilities import (
     default_offline_documented_capabilities,
 )
 from stream_memory_manager.compiler import compile_memory, load_compiled_artifacts
-from stream_memory_manager.consolidator import analyze_corpus, merge_records
+from stream_memory_manager.consolidator import (
+    analyze_corpus,
+    apply_agent_dossiers,
+    build_agent_consolidation_pack,
+    merge_records,
+)
 from stream_memory_manager.db import Database, restore_backup
 from stream_memory_manager.evaluator import (
     generate_native_evaluation_protocol,
@@ -1215,6 +1220,115 @@ def cmd_merge(
         finally:
             db.close()
         _emit(res, as_json=as_json, title="Topic Dossier Merged")
+    except StreamMemoryError as exc:
+        _fail(exc, as_json=as_json)
+
+
+@app.command("agent-pack")
+def cmd_agent_pack(
+    output: Annotated[
+        Path | None,
+        typer.Option(
+            "--output", "-o", help="Optional path to write the agent consolidation JSON pack"
+        ),
+    ] = None,
+    similarity: Annotated[float, typer.Option("--similarity")] = 0.24,
+    data_dir: Annotated[Path, typer.Option("--data-dir")] = _default_data_dir(),
+    as_json: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    """Export an agent-native overlap-cluster & full-record pack for the driving coding agent to synthesize."""
+    try:
+        db = _open_db(data_dir)
+        try:
+            reg = KnowledgeRegistry(db)
+            pack = build_agent_consolidation_pack(reg, similarity_threshold=similarity)
+        finally:
+            db.close()
+        if output is not None:
+            out_path = output.expanduser().resolve()
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_text(
+                json.dumps(pack, indent=2, sort_keys=False) + "\n", encoding="utf-8"
+            )
+            _emit(
+                {
+                    "output_path": str(out_path),
+                    "stats": pack["stats"],
+                    "overlap_clusters": len(pack["overlap_clusters"]),
+                },
+                as_json=as_json,
+                title="Agent Consolidation Pack Exported",
+            )
+            return
+        _emit(pack, as_json=True, title="Agent Consolidation Pack")
+    except StreamMemoryError as exc:
+        _fail(exc, as_json=as_json)
+
+
+@app.command("apply-dossiers")
+def cmd_apply_dossiers(
+    dossiers_file: Annotated[
+        Path,
+        typer.Argument(
+            help="JSON file produced by the driving agent with consolidated `dossiers` and optional `retire_ids`"
+        ),
+    ],
+    compile_after: Annotated[
+        bool,
+        typer.Option(
+            "--compile/--no-compile",
+            help="Run privacy check and compile Stream Notes + Briefing immediately",
+        ),
+    ] = True,
+    include_index: Annotated[
+        bool,
+        typer.Option(
+            "--include-index/--no-index",
+            help="Include separate Table of Contents Log when compiling",
+        ),
+    ] = False,
+    data_dir: Annotated[Path, typer.Option("--data-dir")] = _default_data_dir(),
+    as_json: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    """Atomically apply a driving coding agent's synthesized dense Topic Dossiers and compile."""
+    try:
+        raw_path = dossiers_file.expanduser().resolve()
+        if not raw_path.exists():
+            raise StreamMemoryError(
+                f"Dossiers file not found: {raw_path}",
+                error_class=ErrorClass.VALIDATION_PERMANENT,
+                exit_code=ExitCode.VALIDATION_ERROR,
+            )
+        try:
+            payload = json.loads(raw_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise StreamMemoryError(
+                f"Invalid JSON in {raw_path}: {exc}",
+                error_class=ErrorClass.VALIDATION_PERMANENT,
+                exit_code=ExitCode.VALIDATION_ERROR,
+            ) from exc
+        if not isinstance(payload, dict):
+            raise StreamMemoryError(
+                "Dossiers JSON root must be an object with a `dossiers` list.",
+                error_class=ErrorClass.VALIDATION_PERMANENT,
+                exit_code=ExitCode.VALIDATION_ERROR,
+            )
+
+        db = _open_db(data_dir)
+        try:
+            reg = KnowledgeRegistry(db)
+            res = apply_agent_dossiers(reg, payload, approve=True)
+            priv = evaluate_registry_privacy(reg)
+            res["privacy_summary"] = {
+                "hard_blocked": len(priv["hard_blocked"]),
+                "needs_review": len(priv["needs_review"]),
+                "approved_clean": len(priv["approved_clean"]),
+            }
+            if compile_after:
+                res["compile"] = compile_memory(reg, include_index=include_index)
+        finally:
+            db.close()
+        _emit(res, as_json=as_json, title="Agent-Synthesized Topic Dossiers Applied")
     except StreamMemoryError as exc:
         _fail(exc, as_json=as_json)
 

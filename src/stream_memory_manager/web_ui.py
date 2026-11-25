@@ -2,7 +2,7 @@
 
 Tabs:
 1. Collect    — Scan local coding agents/repos, emit premade Max-Thinking web prompts, paste/upload exports.
-2. Consolidate — Visual Topic Dossier editor, TF-IDF overlap merge suggestions, hygiene triage, optional BYOK/Ollama merge.
+2. Consolidate — Visual Topic Dossier editor, TF-IDF overlap merge suggestions, hygiene triage, and agent-pack handoff.
 3. Preview    — Exact WYSIWYG Stream preview, 1-click Copy Always-On Briefing + Memory folder instruction editor.
 4. Live Sync  — Official Sandbar OAuth 2.1 connect, live Memory/Archive state table, real-time SSE progress monitor,
                 1-Log canary & paced push, 1-click Quarantine Stale / Reset Memory -> Memory Archive, live search tester,
@@ -49,7 +49,6 @@ from stream_memory_manager.compiler import (
 )
 from stream_memory_manager.consolidator import (
     analyze_corpus,
-    auto_consolidate_with_llm,
     merge_records,
 )
 from stream_memory_manager.db import Database
@@ -388,9 +387,8 @@ def _render_ui_html(csrf_token: str) -> str:
         <div class="between" style="margin-bottom:10px;">
           <div>
             <h2>Recommended Topic Merges</h2>
-            <div class="muted">Combine scattered or overlapping notes into dense 650&#8211;900 word dossiers so Stream retrieves the full picture in one hit.</div>
+            <div class="muted">Combine scattered or overlapping notes into dense 650&#8211;900 word dossiers. For lossless synthesis across many sources, let your coding agent run <code>stream-memory agent-pack</code> and <code>apply-dossiers</code> using its own reasoning.</div>
           </div>
-          <button onclick="openLlmMergeSettings()">Optional Auto-Merge LLM</button>
         </div>
         <div id="mergeSuggestionsList"></div>
       </div>
@@ -568,22 +566,6 @@ def _render_ui_html(csrf_token: str) -> str:
     </div>
   </dialog>
 
-  <!-- Optional BYOK / Local Ollama Auto-Merge Settings Dialog -->
-  <dialog id="llmDialog" closedby="any">
-    <h2 style="margin:0 0 8px;">Optional Auto-Merge LLM (Local Ollama or BYOK)</h2>
-    <p class="muted" style="margin-top:0;">Totally optional. Leave blank to use instant built-in deterministic merging or your coding agent via SKILL.md. Keys stay in browser memory for this session only (never saved to disk).</p>
-    <div style="margin-bottom:8px;"><label class="muted">OpenAI-Compatible Base URL</label><input id="llmBaseUrl" type="text" value="http://localhost:11434/v1"></div>
-    <div style="margin-bottom:8px;"><label class="muted">Model</label><input id="llmModel" type="text" value="llama3.2"></div>
-    <div style="margin-bottom:12px;"><label class="muted">API Key (leave empty for local Ollama / MLX)</label><input id="llmApiKey" type="password" placeholder="Optional"></div>
-    <div class="between">
-      <button onclick="clearLlmConfig()">Disable LLM Merge</button>
-      <div class="row">
-        <button onclick="closeDialog('llmDialog')">Cancel</button>
-        <button class="primary" onclick="saveLlmConfig()">Save for Session</button>
-      </div>
-    </div>
-  </dialog>
-
   <div id="toast" class="toast"></div>
 
   <script>
@@ -591,7 +573,6 @@ def _render_ui_html(csrf_token: str) -> str:
     let STATE = null;
     let LIVE_STATE = null;
     let PENDING_RESET_SCOPE = "stale";
-    let LLM_CFG = null;
 
     function toast(msg) {{
       const el = document.getElementById("toast");
@@ -791,7 +772,7 @@ def _render_ui_html(csrf_token: str) -> str:
           );
           left.append(t, sub);
           const right = mk("div", "row");
-          const btn = mk("button", "primary", LLM_CFG ? "AI Merge" : "Merge");
+          const btn = mk("button", "primary", "Merge");
           btn.onclick = () => mergePair(s.record_a, s.record_b, s.title_a, s.suggested_category);
           right.append(btn);
           row.append(left, right);
@@ -804,13 +785,7 @@ def _render_ui_html(csrf_token: str) -> str:
     async function mergePair(idA, idB, title, cat) {{
       try {{
         const payload = {{ source_ids: [idA, idB], target_title: title, target_category: cat }};
-        if (LLM_CFG) {{
-          payload.llm = LLM_CFG;
-          toast("Consolidating with " + LLM_CFG.model + "...");
-          await apiPost("/api/merge-llm", payload);
-        }} else {{
-          await apiPost("/api/merge", payload);
-        }}
+        await apiPost("/api/merge", payload);
         toast("Merged into unified dossier: " + title);
         await refreshAll();
       }} catch (e) {{ toast(e.message); }}
@@ -1161,26 +1136,6 @@ def _render_ui_html(csrf_token: str) -> str:
       }} catch (e) {{ box.textContent = "Search error: " + e.message; }}
     }}
 
-    function openLlmMergeSettings() {{
-      document.getElementById("llmDialog").showModal();
-    }}
-    function saveLlmConfig() {{
-      LLM_CFG = {{
-        base_url: document.getElementById("llmBaseUrl").value.trim(),
-        model: document.getElementById("llmModel").value.trim(),
-        api_key: document.getElementById("llmApiKey").value.trim() || null
-      }};
-      closeDialog("llmDialog");
-      toast("Session Auto-Merge LLM enabled (" + LLM_CFG.model + ")");
-      renderConsolidate();
-    }}
-    function clearLlmConfig() {{
-      LLM_CFG = null;
-      closeDialog("llmDialog");
-      toast("Switched back to built-in deterministic merge");
-      renderConsolidate();
-    }}
-
     refreshAll();
   </script>
 </body>
@@ -1529,43 +1484,6 @@ def create_staging_ui_app(data_dir: Path) -> tuple[Starlette, str]:
         finally:
             db.close()
 
-    async def api_merge_llm(request: Request) -> JSONResponse:
-        err = _check_security(request, require_csrf=True)
-        if err:
-            return err
-        body = await request.json()
-        sids = list(body.get("source_ids") or [])
-        llm = body.get("llm") or {}
-        target_title = str(body.get("target_title", ""))
-        target_cat = body.get("target_category")
-        db = Database(db_path)
-        try:
-            reg = KnowledgeRegistry(db)
-            recs = [r for sid in sids if (r := reg.get_record(str(sid))) is not None]
-            if len(recs) < 2:
-                return JSONResponse({"error": "Need at least 2 valid records"}, status_code=400)
-            synthesized = await auto_consolidate_with_llm(
-                recs,
-                target_title=target_title or str(recs[0]["title"]),
-                base_url=str(llm.get("base_url", "http://localhost:11434/v1")),
-                model=str(llm.get("model", "llama3.2")),
-                api_key=llm.get("api_key"),
-            )
-            res = merge_records(
-                reg,
-                sids,
-                target_title=target_title or str(recs[0]["title"]),
-                target_category=target_cat,
-                merged_body=synthesized,
-                approve=True,
-            )
-            evaluate_registry_privacy(reg)
-            return JSONResponse({"ok": True, **res})
-        except StreamMemoryError as exc:
-            return JSONResponse({"error": str(exc)}, status_code=400)
-        finally:
-            db.close()
-
     async def api_approve_clean(request: Request) -> JSONResponse:
         err = _check_security(request, require_csrf=True)
         if err:
@@ -1869,7 +1787,6 @@ def create_staging_ui_app(data_dir: Path) -> tuple[Starlette, str]:
             Route("/api/decide", api_decide, methods=["POST"]),
             Route("/api/edit", api_edit, methods=["POST"]),
             Route("/api/merge", api_merge, methods=["POST"]),
-            Route("/api/merge-llm", api_merge_llm, methods=["POST"]),
             Route("/api/approve-clean", api_approve_clean, methods=["POST"]),
             Route("/api/compile", api_compile, methods=["POST"]),
             Route("/api/stream/connect", api_stream_connect, methods=["POST"]),

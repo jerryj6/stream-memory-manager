@@ -2,11 +2,22 @@
 
 All notable changes to **Stream Memory Manager** are documented in this file.
 
+## [0.3.0] — 2026-11-25
+
+### Added
+- **Agent-Native Consolidation Primitives (`agent-pack`, `apply-dossiers`):** Exports connected-component overlap clusters, hygiene triage, and full raw source handoffs in one compact JSON pack so the driving coding agent itself synthesizes dense, lossless 600–880 word Topic Dossiers using its own reasoning and commits + compiles them in one atomic call.
+- **50x Faster Live Inspection & Personal Voice Note Protection (`inspect-live`):** Lazy preview hydration parses Sandbar `list_artifacts` previews directly and only fetches full bodies on title matches; tracks managed artifact IDs so `--stale-only` quarantine never touches user-authored personal Stream voice notes.
+- **Headless Linux / CI Resilience:** Studio `/api/state` degrades cleanly when no OS keyring daemon is available.
+- **Sentence-Bounded Always-On Briefing:** Never truncates mid-word or drops the Memory retrieval directive.
+
+### Changed
+- **Pure Agent-Driven Workflow (`SKILL.md`, `README.md`, `web_ui.py`):** Removed pointless BYOK / Ollama LLM wrapper code, API-key modal, and `/api/merge-llm` route — the driving coding agent is the intelligence layer, ending with automated driving of the official `https://stream.sandbar.com` web app to permanently delete `Memory Archive`, save the Always-On Briefing, and verify live Memory end-to-end.
+
 ## [0.2.0] — 2026-11-25
 
 ### Added
 - **Stream Memory Studio (Unified 4-Tab Local Web App):** Running `stream-memory` (or `uvx --from git+https://github.com/jerryj6/stream-memory-manager stream-memory`) launches a clean 4-tab Studio (`Collect -> Consolidate -> Briefing & Preview -> Live Sync & Monitor`) directly at `http://127.0.0.1:4319/view` — zero 13-command terminal gauntlet.
-- **Semantic Consolidation & Hygiene Engine (`consolidator.py`, `consolidate`, `merge`):** Detects overlapping records via TF-IDF + entity overlap, flags sparse fragments / repeated meta-boilerplate / dated windows, merges topics cleanly into dense 650–900 word Topic Dossiers, and supports opt-in BYOK / local Ollama Auto-Merge.
+- **Semantic Consolidation & Hygiene Engine (`consolidator.py`, `consolidate`, `merge`):** Detects overlapping records via TF-IDF + entity overlap, flags sparse fragments / repeated meta-boilerplate / dated windows, and merges topics cleanly into dense 650–900 word Topic Dossiers.
 - **Live Sync Monitor, SSE Progress & Live Search Tester (`inspect-live`, `search-live`):** Pulls live `Memory` & `Memory Archive` state via official Sandbar MCP, streams real-time SSE sync/quarantine progress in the Studio, tests live Stream retrieval quality right in the UI, and links directly to `https://stream.sandbar.com`.
 - **1-Click Safe Quarantine & Reset (`reset-memory`, `quarantine_logs_to_archive`):** Preserves exact float `lastUpdateUnixTs` for Sandbar `set_note_folder` optimistic concurrency so stale or all `Memory` notes can be quarantined into `Memory Archive` via 100% official MCP for clean deletion in Stream Web.
 - **Deep Local Git Repo Harvester (`local_projects`):** Scans local git workspaces read-only for `README.md` summaries and tech stacks while skipping secrets/`.env`.
