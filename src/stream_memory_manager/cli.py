@@ -1253,12 +1253,14 @@ def cmd_inspect_live(
                 expected_mode=ExecutionMode.LIVE,
                 capabilities=CapabilityStore(db).get_latest(server_url),
             )
+            managed_ids = db.list_managed_remote_ids()
             res = asyncio.run(
                 inspect_live_memory_state(
                     adapter,
                     compiled_logs,
                     target_folder_name=folder,
                     archive_folder_name=archive_folder,
+                    managed_artifact_ids=managed_ids,
                 )
             )
         finally:
@@ -1326,12 +1328,14 @@ def cmd_reset_memory(
                 compiled_logs = [
                     a for a in load_compiled_artifacts(reg) if a.artifact_kind == "log"
                 ]
+                managed_ids = db.list_managed_remote_ids()
                 live = asyncio.run(
                     inspect_live_memory_state(
                         adapter,
                         compiled_logs,
                         target_folder_name=folder,
                         archive_folder_name=archive_folder,
+                        managed_artifact_ids=managed_ids,
                     )
                 )
                 target_ids = [str(x["remote_id"]) for x in live["stale_in_stream"]]

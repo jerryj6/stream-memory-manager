@@ -1659,8 +1659,11 @@ def create_staging_ui_app(data_dir: Path) -> tuple[Starlette, str]:
         try:
             reg = KnowledgeRegistry(db)
             compiled_logs = [a for a in load_compiled_artifacts(reg) if a.artifact_kind == "log"]
+            managed_ids = db.list_managed_remote_ids()
             adapter = _build_live_adapter(db, data_dir)
-            live = await inspect_live_memory_state(adapter, compiled_logs)
+            live = await inspect_live_memory_state(
+                adapter, compiled_logs, managed_artifact_ids=managed_ids
+            )
             return JSONResponse(live)
         except StreamMemoryError as exc:
             return JSONResponse({"error": redact_secrets(str(exc))}, status_code=400)

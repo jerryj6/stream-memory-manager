@@ -194,10 +194,19 @@ async def test_live_inspect_and_quarantine_to_memory_archive(
         body="Another old fragment.",
         folder_id=mem_folder.folder_id,
     )
+    # User-authored personal voice note must NOT be misclassified as a stale managed note
+    await adapter.create_log(
+        title="Quick voice reminder",
+        body="Pick up groceries on the way back.",
+        folder_id=mem_folder.folder_id,
+    )
 
-    live_before = await inspect_live_memory_state(adapter, compiled_logs)
+    live_before = await inspect_live_memory_state(
+        adapter, compiled_logs, managed_artifact_ids=tmp_db.list_managed_remote_ids()
+    )
     assert len(live_before["in_sync"]) == 1
     assert len(live_before["stale_in_stream"]) == 2
+    assert len(live_before["user_notes_in_memory"]) == 1
     assert live_before["archive_count"] == 0
 
     # Quarantine ONLY the 2 stale notes into Memory Archive via official set_note_folder

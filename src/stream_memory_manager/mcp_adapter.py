@@ -64,6 +64,7 @@ class RemoteLog:
     raw_last_update_ts: float | int | None = None
     search_index_status: str | None = None
     created_via_mcp: bool | None = None
+    preview: str = ""
 
 
 @dataclass(frozen=True)
@@ -937,6 +938,7 @@ def _parse_remote_log(item: dict[str, Any]) -> RemoteLog:
         raw_last_update_ts=raw_ts_val,
         search_index_status=item.get("searchIndexStatus"),
         created_via_mcp=via_mcp,
+        preview=str(item.get("preview") or ""),
     )
 
 
@@ -947,6 +949,26 @@ DEFAULT_ARCHIVE_INSTRUCTION = (
 )
 
 
+def _display_title_for_log(rl: RemoteLog) -> str:
+    if rl.title.strip():
+        return rl.title.strip()
+    if rl.preview.strip():
+        first_line = rl.preview.strip().splitlines()[0].strip()
+        if first_line:
+            return first_line[:140]
+    return "(Untitled Note)"
+
+
+def _is_managed_memory_note(rl: RemoteLog, managed_ids: set[str]) -> bool:
+    """Distinguish Stream Memory Manager managed notes from user-authored Stream voice notes."""
+    import re
+
+    if rl.artifact_id and rl.artifact_id in managed_ids:
+        return True
+    disp = _display_title_for_log(rl)
+    return bool(re.match(r"^[A-Z][A-Z0-9_]{1,18}\s+[—–-]\s+", disp))
+
+
 async def inspect_live_memory_state(
     adapter: SandbarMCPAdapter,
     compiled_logs: list[Any],
@@ -954,8 +976,13 @@ async def inspect_live_memory_state(
     target_folder_name: str = "Memory",
     archive_folder_name: str = DEFAULT_ARCHIVE_FOLDER_NAME,
     hydrate: bool = True,
+    managed_artifact_ids: set[str] | None = None,
 ) -> dict[str, Any]:
-    """Inspect live Sandbar Memory & Memory Archive folders read-only and diff vs local compiled Logs."""
+    """Inspect live Sandbar Memory & Memory Archive folders read-only and diff vs local compiled Logs.
+
+    Uses lazy hydration: only fetches full bodies via `get_artifact` when a note's preview title
+    matches a local compiled dossier (or has no preview), turning 60+ note inspections from >100s into ~1-2s.
+    """
     from stream_memory_manager.compiler import normalize_remote_text
     from stream_memory_manager.security import canonical_json_hash
 
@@ -967,12 +994,25 @@ async def inspect_live_memory_state(
     mem_folder = next((f for f in folders if f.name == target_folder_name), None)
     arch_folder = next((f for f in folders if f.name == archive_folder_name), None)
 
+    compiled_titles_norm = {normalize_remote_text(str(art.title)) for art in compiled_logs}
+
     live_mem_logs: list[RemoteLog] = []
     if mem_folder is not None and caps.supports_list_artifacts:
         listed = await adapter.list_artifacts(folder_id=mem_folder.folder_id)
         if hydrate and caps.supports_get_artifact:
             for rl in listed:
-                if rl.artifact_id and (not rl.body.strip() or not rl.title.strip()):
+                disp = _display_title_for_log(rl)
+                disp_norm = normalize_remote_text(disp)
+                needs_full_body = not rl.body.strip() and (
+                    not rl.preview.strip()
+                    or disp_norm in compiled_titles_norm
+                    or any(
+                        ct.startswith(disp_norm) or disp_norm.startswith(ct)
+                        for ct in compiled_titles_norm
+                        if len(disp_norm) >= 12
+                    )
+                )
+                if rl.artifact_id and needs_full_body:
                     full = await adapter.get_artifact(rl.artifact_id)
                     live_mem_logs.append(full if full is not None else rl)
                 else:
@@ -984,19 +1024,20 @@ async def inspect_live_memory_state(
     if arch_folder is not None and caps.supports_list_artifacts:
         archive_items = await adapter.list_artifacts(folder_id=arch_folder.folder_id)
 
-    # Index remote Memory logs by normalized hash & normalized title
+    # Index remote Memory logs by normalized hash & normalized display title
     remote_by_hash: dict[str, RemoteLog] = {}
     remote_by_title: dict[str, RemoteLog] = {}
     for rl in live_mem_logs:
-        nh = canonical_json_hash(
-            {
-                "title": normalize_remote_text(rl.title),
-                "body": normalize_remote_text(rl.body),
-            }
-        )
-        remote_by_hash[nh] = rl
-        nt = normalize_remote_text(rl.title)
-        if nt:
+        if rl.body.strip():
+            nh = canonical_json_hash(
+                {
+                    "title": normalize_remote_text(rl.title),
+                    "body": normalize_remote_text(rl.body),
+                }
+            )
+            remote_by_hash[nh] = rl
+        nt = normalize_remote_text(_display_title_for_log(rl))
+        if nt and nt != "(untitled note)":
             remote_by_title[nt] = rl
 
     matched_remote_ids: set[str] = set()
@@ -1045,18 +1086,23 @@ async def inspect_live_memory_state(
                 }
             )
 
+    managed_ids = managed_artifact_ids or set()
     stale_in_stream: list[dict[str, Any]] = []
+    user_notes_in_memory: list[dict[str, Any]] = []
     for rl in live_mem_logs:
         if rl.artifact_id and rl.artifact_id not in matched_remote_ids:
-            stale_in_stream.append(
-                {
-                    "remote_id": rl.artifact_id,
-                    "title": rl.title or "(Untitled Note)",
-                    "preview": rl.body[:160].replace("\n", " "),
-                    "last_update_ts": rl.raw_last_update_ts or rl.last_update_ts,
-                    "status": "STALE_IN_STREAM",
-                }
-            )
+            disp_title = _display_title_for_log(rl)
+            snippet = (rl.body or rl.preview)[:160].replace("\n", " ")
+            entry = {
+                "remote_id": rl.artifact_id,
+                "title": disp_title,
+                "preview": snippet,
+                "last_update_ts": rl.raw_last_update_ts or rl.last_update_ts,
+            }
+            if _is_managed_memory_note(rl, managed_ids):
+                stale_in_stream.append({**entry, "status": "STALE_IN_STREAM", "managed": True})
+            else:
+                user_notes_in_memory.append({**entry, "status": "USER_NOTE", "managed": False})
 
     return {
         "stream_web_url": STREAM_WEB_URL,
@@ -1071,6 +1117,7 @@ async def inspect_live_memory_state(
         "new_local": new_local,
         "changed_local": changed_local,
         "stale_in_stream": stale_in_stream,
+        "user_notes_in_memory": user_notes_in_memory,
         "supports_move": bool(caps.supports_move_log),
         "supports_delete": bool(caps.supports_delete_log),
     }

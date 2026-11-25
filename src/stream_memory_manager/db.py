@@ -469,6 +469,18 @@ class Database:
             "metadata": metadata,
         }
 
+    def list_managed_remote_ids(self) -> set[str]:
+        """Return every remote Sandbar artifact ID ever created or tracked by this local DB."""
+        rows = self._conn.execute(
+            "SELECT DISTINCT remote_id FROM operations WHERE remote_id IS NOT NULL;"
+        ).fetchall()
+        rec_rows = self._conn.execute(
+            "SELECT DISTINCT remote_id FROM memory_records WHERE remote_id IS NOT NULL;"
+        ).fetchall()
+        out = {str(r[0]) for r in rows if r[0]}
+        out.update(str(r[0]) for r in rec_rows if r[0])
+        return out
+
     def table_counts(self) -> dict[str, int]:
         queries = {
             "sources": "SELECT COUNT(*) AS c FROM sources;",
