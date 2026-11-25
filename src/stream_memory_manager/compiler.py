@@ -412,8 +412,19 @@ def _build_briefing_artifact(
     approved_records: list[dict[str, Any]] | None = None,
 ) -> CompiledArtifact:
     """Build a dense, high-signal Stream Briefing ready for 1-click copy into Stream's Briefing field."""
-    # Pull concise core identity/briefing snippet if present, plus exact topic dossier directory
-    parts: list[str] = []
+    word_budget = DEFAULT_BRIEFING_MAX_WORDS - 12
+    topic_logs = [a for a in compiled_logs if not a.artifact_key.startswith("core_knowledge_index")]
+
+    # Always preserve the full actionable retrieval directive intact
+    directive = (
+        "Search and retrieve the relevant Memory note before asking me to repeat established context. "
+        "Prefer newer corrections, separate built/verified work from proposals, and keep voice replies direct."
+    )
+    directive_words = len(directive.split())
+
+    # Reserve ~100 words for complete sentences from the CORE briefing record
+    intro_budget = min(105, max(45, (word_budget - directive_words) // 2 + 12))
+    intro_text = ""
     if approved_records:
         briefing_rec = next(
             (
@@ -426,34 +437,53 @@ def _build_briefing_artifact(
         )
         if briefing_rec is not None:
             raw_b = _clean_voice_prose(str(briefing_rec.get("body", "")).strip())
-            # Take up to first 110 words of core briefing
-            words = raw_b.split()
-            snippet = " ".join(words[:110]).strip()
-            if len(words) > 110:
-                snippet = snippet.rstrip(".,;:") + "..."
-            if snippet:
-                parts.append(snippet)
+            flat = " ".join(
+                ln.strip()
+                for ln in raw_b.splitlines()
+                if ln.strip() and not ln.strip().startswith("#")
+            )
+            sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", flat) if s.strip()]
+            chosen: list[str] = []
+            used = 0
+            for sent in sentences:
+                sw = len(sent.split())
+                if used + sw > intro_budget:
+                    if not chosen:
+                        chosen.append(" ".join(sent.split()[:intro_budget]).rstrip(".,;:") + ".")
+                    break
+                chosen.append(sent)
+                used += sw
+            intro_text = " ".join(chosen).strip()
 
-    topic_titles = [
-        a.title for a in compiled_logs if not a.artifact_key.startswith("core_knowledge_index")
-    ]
-    shown_titles = topic_titles[:16]
-    more_str = (
-        f" (+{len(topic_titles) - len(shown_titles)} more)"
-        if len(topic_titles) > len(shown_titles)
+    # Pack complete dossier titles cleanly into the remaining word budget (never chop mid-title!)
+    intro_words = len(intro_text.split()) if intro_text else 0
+    topics_budget = max(20, word_budget - directive_words - intro_words - 14)
+    chosen_titles: list[str] = []
+    used_t = 0
+    remaining_cats: list[str] = []
+    for a in topic_logs:
+        short_title = a.title.split(" — ", 1)[1] if " — " in a.title else a.title
+        tw = len(short_title.split())
+        if used_t + tw <= topics_budget or not chosen_titles:
+            chosen_titles.append(short_title)
+            used_t += tw
+        elif a.category not in remaining_cats:
+            remaining_cats.append(a.category)
+
+    omitted = len(topic_logs) - len(chosen_titles)
+    tail = (
+        f" (+{omitted} more across {', '.join(remaining_cats)})"
+        if omitted > 0 and remaining_cats
+        else (f" (+{omitted} more)" if omitted > 0 else "")
+    )
+    directory_line = (
+        f"Memory folder ({len(topic_logs)} dossiers): {'; '.join(chosen_titles)}{tail}."
+        if topic_logs
         else ""
     )
-    parts.append(
-        f"Full details live in the Memory folder ({len(topic_titles)} dossiers): "
-        f"{'; '.join(shown_titles)}{more_str}. "
-        "Search and retrieve the full relevant Memory note before asking me to repeat established context. "
-        "Prefer newer corrections, distinguish built/verified work from proposals, and keep replies direct."
-    )
+
+    parts = [p for p in (intro_text, directory_line, directive) if p]
     body = normalize_remote_text("\n\n".join(parts))
-    # Enforce hard briefing word cap conservatively
-    all_w = body.split()
-    if len(all_w) > DEFAULT_BRIEFING_MAX_WORDS - 15:
-        body = " ".join(all_w[: DEFAULT_BRIEFING_MAX_WORDS - 15]).rstrip(".,;:") + "."
 
     ws, cons = validate_log_payload(
         "Stream Memory Briefing", body, max_words=DEFAULT_BRIEFING_MAX_WORDS + 40
