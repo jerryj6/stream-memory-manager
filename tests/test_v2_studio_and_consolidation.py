@@ -437,3 +437,133 @@ def test_clean_room_plaintext_compiler_and_default_data_dir(
     empty_cwd.mkdir()
     monkeypatch.chdir(empty_cwd)
     assert _default_data_dir() == Path.home() / ".local" / "share" / "stream-memory-manager"
+
+
+async def test_v032_cleanroom_blackbox_regressions(
+    tmp_path: Path, mock_server: RunningMockServer
+) -> None:
+    """Guard all 6 bugs uncovered during the black-box clean-room agent audit."""
+    import json
+
+    from typer.testing import CliRunner
+
+    from stream_memory_manager.cli import app
+    from stream_memory_manager.harvesters import parse_web_export_to_markdown
+
+    # 1. harvest-export preserves >220 char messages cleanly (no silent mid-phrase truncation) + created_at
+    long_msg = (
+        "Building beamforge-rs, an open-source no_std Rust crate implementing delay-and-sum "
+        "and MVDR acoustic beamforming for an 8-mic STM32H743 array. Benchmarked diagonal "
+        "loading lambda=1e-3 on synthetic bird calls with 14 dB SNR gain."
+    )
+    assert len(long_msg) > 220
+    exp_json = tmp_path / "claude_export.json"
+    exp_json.write_text(
+        json.dumps(
+            [
+                {
+                    "name": "beamforge-rs MVDR",
+                    "created_at": "2026-11-15T18:20:00Z",
+                    "chat_messages": [{"sender": "human", "text": long_msg}],
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    out_md = tmp_path / "export_out.md"
+    parse_web_export_to_markdown(exp_json, out_md)
+    md_text = out_md.read_text(encoding="utf-8")
+    assert "14 dB SNR gain." in md_text
+    assert "(2026-11-15)" in md_text
+
+    # 2 & 3. backup writes into <data-dir>/backups (not CWD), and web-prompts omits EXCLUDED_SECURITY
+    data_dir = tmp_path / "isolated_data"
+    db = Database(data_dir / "stream_memory.db")
+    try:
+        reg = KnowledgeRegistry(db)
+        reg.upsert_record(
+            MemoryRecordInput(
+                logical_id="rec_ops",
+                title="Operating Instructions",
+                category="CORE",
+                body="- Keep voice replies direct.",
+                inclusion_decision=InclusionDecision.APPROVED,
+            )
+        )
+        reg.upsert_record(
+            MemoryRecordInput(
+                logical_id="rec_bio",
+                title="Maya Chen Profile and Background",
+                category="CORE",
+                body="Maya Chen is a robotics and acoustics engineer in Seattle.",
+                inclusion_decision=InclusionDecision.APPROVED,
+            )
+        )
+        reg.upsert_record(
+            MemoryRecordInput(
+                logical_id="rec_secret",
+                title="Accidental Leaked Secret Scratch Note",
+                category="INFRASTRUCTURE",
+                body="Leaked sk-proj-FAKECLEANROOMKEY1234567890ABCD",
+                inclusion_decision=InclusionDecision.EXCLUDED,
+                destination_eligible=False,
+            )
+        )
+        from stream_memory_manager.privacy import evaluate_registry_privacy
+
+        evaluate_registry_privacy(reg)
+        compile_memory(reg, include_index=False)
+        # 4. Briefing prioritizes Profile over Operating Instructions
+        briefing = next(a for a in load_compiled_artifacts(reg) if a.artifact_kind == "briefing")
+        assert "Maya Chen is a robotics" in briefing.body
+    finally:
+        db.close()
+
+    runner = CliRunner()
+    bak_res = runner.invoke(
+        app, ["backup", "--data-dir", str(data_dir), "--label", "iso", "--json"]
+    )
+    assert bak_res.exit_code == 0, bak_res.output
+    bak_payload = json.loads(bak_res.output)
+    assert Path(bak_payload["backup_path"]).parent == (data_dir / "backups").resolve()
+
+    wp_res = runner.invoke(
+        app,
+        [
+            "web-prompts",
+            "--services",
+            "chatgpt",
+            "--mode",
+            "delta",
+            "--covered-from-db",
+            "--data-dir",
+            str(data_dir),
+            "--raw",
+        ],
+    )
+    assert wp_res.exit_code == 0, wp_res.output
+    assert "Maya Chen Profile" in wp_res.output
+    assert "Accidental Leaked Secret Scratch Note" not in wp_res.output
+
+    # 5. Mock server multi-keyword search works cleanly
+    tok = mock_server.state.issue_token("acct_primary")
+    sched = AccountRateScheduler(
+        Database(tmp_path / "search_rl.db"), "acct_search", min_interval_seconds=0.0
+    )
+    adapter = SandbarMCPAdapter(
+        server_url=mock_server.mcp_url,
+        scheduler=sched,
+        bearer_token=tok["access_token"],
+        allow_localhost_http=True,
+        expected_mode=ExecutionMode.MOCK,
+    )
+    await adapter.discover_capabilities()
+    mf = await adapter.create_folder("Memory")
+    await adapter.create_log(
+        title="ENGINEERING — Acoustic Sensor Array",
+        body="STM32H743 driving 8x INMP441 MEMS mics running MVDR beamforming.",
+        folder_id=mf.folder_id,
+    )
+    hits = await adapter.search_logs("STM32H743 INMP441 beamforming", folder_id=mf.folder_id)
+    assert len(hits) == 1
+    assert "Acoustic Sensor Array" in hits[0].title

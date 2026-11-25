@@ -1061,11 +1061,18 @@ def parse_web_export_to_markdown(
         "",
     ]
 
+    def _clip_clean(text: str, limit: int = 1200) -> str:
+        if len(text) <= limit:
+            return text
+        cut = text[:limit].rsplit(" ", 1)[0].rstrip(".,;:")
+        return (cut or text[:limit]) + "..."
+
     extracted = 0
     for convo in convos[:max_conversations]:
         title = redact_secrets(
             str(convo.get("title") or convo.get("name") or "Untitled Thread")
         ).strip()
+        raw_dt = str(convo.get("created_at") or convo.get("updated_at") or "")[:10]
         user_snippets: list[str] = []
 
         # ChatGPT mapping tree
@@ -1080,14 +1087,14 @@ def parse_web_export_to_markdown(
                     txt = " ".join(str(p) for p in parts if isinstance(p, str))
                     cleaned = " ".join(redact_secrets(txt).split())
                     if len(cleaned) >= 10:
-                        user_snippets.append(cleaned[:220])
+                        user_snippets.append(_clip_clean(cleaned))
         # Claude chat_messages list
         elif isinstance(convo.get("chat_messages"), list):
             for m in convo["chat_messages"]:
                 if isinstance(m, dict) and str(m.get("sender", "")).lower() in ("human", "user"):
                     cleaned = " ".join(redact_secrets(str(m.get("text", ""))).split())
                     if len(cleaned) >= 10:
-                        user_snippets.append(cleaned[:220])
+                        user_snippets.append(_clip_clean(cleaned))
         # Generic messages array (DeepSeek / T3 / Grok / Gemini JSON)
         elif isinstance(convo.get("messages"), list):
             for m in convo["messages"]:
@@ -1096,11 +1103,12 @@ def parse_web_export_to_markdown(
                         redact_secrets(str(m.get("content") or m.get("text") or "")).split()
                     )
                     if len(cleaned) >= 10:
-                        user_snippets.append(cleaned[:220])
+                        user_snippets.append(_clip_clean(cleaned))
 
-        lines.append(f"## {title}")
+        heading = f"## {title} ({raw_dt})" if raw_dt else f"## {title}"
+        lines.append(heading)
         if user_snippets:
-            for sn in user_snippets[:3]:
+            for sn in user_snippets[:6]:
                 lines.append(f"- {sn}")
         else:
             lines.append("- (No user text snippets extracted)")

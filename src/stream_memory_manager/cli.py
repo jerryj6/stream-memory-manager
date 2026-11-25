@@ -979,16 +979,22 @@ def cmd_export(
 
 @app.command("backup")
 def cmd_backup(
-    output_dir: Annotated[Path, typer.Option("--output-dir")] = Path("data/backups"),
+    output_dir: Annotated[
+        Path | None,
+        typer.Option(
+            "--output-dir", help="Backup destination dir (defaults to <data-dir>/backups)"
+        ),
+    ] = None,
     label: Annotated[str, typer.Option("--label")] = "manual",
     data_dir: Annotated[Path, typer.Option("--data-dir")] = _default_data_dir(),
     as_json: Annotated[bool, typer.Option("--json")] = False,
 ) -> None:
     """Create a WAL-consistent SQLite Online Backup snapshot with SHA-256 metadata."""
     try:
+        dest_dir = output_dir if output_dir is not None else (data_dir / "backups")
         db = _open_db(data_dir)
         try:
-            res = db.backup_to(output_dir, label=label)
+            res = db.backup_to(dest_dir, label=label)
         finally:
             db.close()
         _emit(res, as_json=as_json, title="SQLite Online Backup Created")
@@ -1189,7 +1195,14 @@ def cmd_web_prompts(
             db = _open_db(data_dir)
             try:
                 reg = KnowledgeRegistry(db)
-                recs = reg.list_records()
+                recs = [
+                    r
+                    for r in reg.list_records()
+                    if str(r["status"]) not in ("SUPERSEDED", "ARCHIVED")
+                    and str(r["inclusion_decision"]) != "EXCLUDED"
+                    and str(r["privacy_classification"])
+                    not in ("EXCLUDED_SECURITY", "EXCLUDED_PRIVACY", "EXCLUDED_CONFIDENTIAL")
+                ]
                 covered_topics = [str(r["title"]) for r in recs if r.get("title")]
                 if start_section is None:
                     resolved_start = len(recs)
@@ -1378,12 +1391,25 @@ def cmd_apply_dossiers(
             reg = KnowledgeRegistry(db)
             res = apply_agent_dossiers(reg, payload, approve=True)
             priv = evaluate_registry_privacy(reg)
+            active_lids = {
+                str(r["logical_id"])
+                for r in reg.list_records()
+                if str(r["status"]) not in ("SUPERSEDED", "ARCHIVED")
+                and str(r["inclusion_decision"]) != "EXCLUDED"
+            }
+            active_hard_blocked = [
+                item for item in priv["hard_blocked"] if str(item["logical_id"]) in active_lids
+            ]
+            active_needs_review = [
+                item for item in priv["needs_review"] if str(item["logical_id"]) in active_lids
+            ]
             res["privacy_summary"] = {
-                "hard_blocked": len(priv["hard_blocked"]),
-                "needs_review": len(priv["needs_review"]),
+                "hard_blocked": len(active_hard_blocked),
+                "needs_review": len(active_needs_review),
                 "approved_clean": len(priv["approved_clean"]),
-                "hard_blocked_items": priv["hard_blocked"],
-                "needs_review_items": priv["needs_review"],
+                "excluded_or_blocked_total": len(priv["hard_blocked"]) + len(priv["excluded"]),
+                "hard_blocked_items": active_hard_blocked,
+                "needs_review_items": active_needs_review,
             }
             if compile_after:
                 comp = compile_memory(reg, include_index=include_index)

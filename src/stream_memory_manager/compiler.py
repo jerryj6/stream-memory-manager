@@ -448,22 +448,41 @@ def _build_briefing_artifact(
     intro_budget = min(105, max(45, (word_budget - directive_words) // 2 + 12))
     intro_text = ""
     if approved_records:
-        briefing_rec = next(
-            (
-                r
-                for r in approved_records
-                if "briefing" in str(r.get("title", "")).lower()
-                or str(r.get("category", "")).upper() == "CORE"
-            ),
-            None,
+        # Prefer explicit personal Briefing / Profile / Background record over Operating Instructions
+        briefing_rec = (
+            next(
+                (
+                    r
+                    for r in approved_records
+                    if any(
+                        kw in str(r.get("title", "")).lower()
+                        for kw in ("briefing", "profile", "background", "about me")
+                    )
+                ),
+                None,
+            )
+            or next(
+                (
+                    r
+                    for r in approved_records
+                    if str(r.get("category", "")).upper() == "CORE"
+                    and "operating instruction" not in str(r.get("title", "")).lower()
+                ),
+                None,
+            )
+            or next(
+                (r for r in approved_records if str(r.get("category", "")).upper() == "CORE"),
+                None,
+            )
         )
         if briefing_rec is not None:
             raw_b = _clean_voice_prose(str(briefing_rec.get("body", "")).strip())
-            flat = " ".join(
-                ln.strip()
+            clean_lines = [
+                re.sub(r"^\s*[-*•]\s+", "", ln.strip())
                 for ln in raw_b.splitlines()
-                if ln.strip() and not ln.strip().startswith("#")
-            )
+                if ln.strip() and not ln.strip().startswith("#") and not ln.strip().endswith(":")
+            ]
+            flat = " ".join(clean_lines)
             sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", flat) if s.strip()]
             chosen: list[str] = []
             used = 0

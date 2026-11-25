@@ -2,6 +2,16 @@
 
 All notable changes to **Stream Memory Manager** are documented in this file.
 
+## [0.3.2] — 2026-11-25
+
+### Fixed (Discovered via Black-Box Clean-Room Agent Audit)
+- **No Silent Truncation in `harvest-export`:** Raised official web export per-message preservation from 220 to 1,200 chars (with word-boundary ellipsis only above limit), preserved up to 6 messages per thread, and kept `created_at` dates on headings.
+- **`backup` Respects `--data-dir` / `STREAM_MEMORY_DATA_DIR`:** Fixed `backup` defaulting to `./data/backups` relative to CWD instead of `<data_dir>/backups`.
+- **Zero Excluded Title Leaks in `web-prompts --covered-from-db`:** Filters out `EXCLUDED_SECURITY` / `EXCLUDED_PRIVACY` / `SUPERSEDED` records so blocked note titles are never pasted into external web AIs.
+- **Accurate `apply-dossiers` Privacy Summary:** Reports `hard_blocked` and `needs_review` strictly over active dossiers rather than superseded/excluded archive rows.
+- **Briefing Identity Priority (`compiler.py`):** Prefers personal `Briefing` / `Profile` / `Background` records over `Operating Instructions` when packing the Always-On Briefing.
+- **Tokenized Mock Server Search:** Upgraded `mock_server.py` `search` from contiguous substring to ranked keyword matching so multi-term `search-live` checks work identically in mock tests.
+
 ## [0.3.1] — 2026-11-25
 
 ### Fixed (Clean-Room Hardening)

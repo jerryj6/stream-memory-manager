@@ -10,6 +10,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import re
 import secrets
 import socket
 import threading
@@ -879,9 +880,10 @@ class MockSandbarState:
                 return self._tool_ok(req_id, {"artifacts": page_items, "nextBefore": next_before})
 
             if tool_name == "search":
-                q = str(args.get("query", "")).lower()
+                q = str(args.get("query", "")).strip().lower()
+                q_tokens = [t for t in re.findall(r"[a-z0-9][a-z0-9_-]*", q) if len(t) >= 2]
                 search_fid = args.get("folder_id")
-                hits: list[dict[str, Any]] = []
+                scored_hits: list[tuple[int, dict[str, Any]]] = []
                 for lid, log_rec in acct.logs.items():
                     if lid in acct.suppressed_evidence_ids:
                         continue
@@ -889,11 +891,22 @@ class MockSandbarState:
                         continue
                     if acct.index_delay_remaining.get(lid, 0) > 0:
                         continue
-                    if q in str(log_rec["title"]).lower() or q in str(log_rec["body"]).lower():
-                        if self.config.snippet_only_search:
-                            hits.append({**log_rec, "body": ""})
-                        else:
-                            hits.append(log_rec)
+                    haystack = f"{log_rec['title']}\n{log_rec['body']}".lower()
+                    score = 0
+                    if q and q in haystack:
+                        score = 100 + len(q_tokens)
+                    elif q_tokens:
+                        matched = sum(1 for tok in q_tokens if tok in haystack)
+                        needed = 1 if len(q_tokens) <= 2 else max(2, (len(q_tokens) + 1) // 2)
+                        if matched >= needed:
+                            score = matched
+                    if score > 0:
+                        rec_out = (
+                            {**log_rec, "body": ""} if self.config.snippet_only_search else log_rec
+                        )
+                        scored_hits.append((score, rec_out))
+                scored_hits.sort(key=lambda pair: -pair[0])
+                hits = [rec for _, rec in scored_hits]
                 if fault and fault.fault_type == "partial_search":
                     hits = []
                 return self._tool_ok(req_id, {"notes": hits})
