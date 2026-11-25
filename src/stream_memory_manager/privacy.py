@@ -83,16 +83,6 @@ HARD_BLOCK_PATTERNS: tuple[tuple[str, PrivacyClassification, re.Pattern[str]], .
         ),
     ),
     (
-        "coursework_automation",
-        PrivacyClassification.EXCLUDED_PRIVACY,
-        re.compile(r"(?i)\b(?:smartbook-automation|packback_live_score\.user\.js)\b"),
-    ),
-    (
-        "sandbar_forensic_dossier",
-        PrivacyClassification.EXCLUDED_CONFIDENTIAL,
-        re.compile(r"(?i)\bSANDBAR_STREAM_COMPLETE_HANDOFF\b"),
-    ),
-    (
         "raw_medical_measurements",
         PrivacyClassification.EXCLUDED_PRIVACY,
         re.compile(

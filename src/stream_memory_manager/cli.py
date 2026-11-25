@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Annotated, Any
@@ -83,10 +84,34 @@ auth_app = typer.Typer(help="Manage legitimate OAuth 2.1 Sandbar connections.")
 app.add_typer(auth_app, name="auth")
 
 
+def _default_data_dir() -> Path:
+    """Resolve private local data directory cleanly without polluting unrelated working directories.
+
+    Priority:
+    1. Explicit `STREAM_MEMORY_DATA_DIR` environment variable.
+    2. Local `./data` if already inside a stream-memory-manager repo checkout (or `./data/stream_memory.db` exists).
+    3. XDG-style private user data dir `~/.local/share/stream-memory-manager`.
+    """
+    env_dir = os.environ.get("STREAM_MEMORY_DATA_DIR", "").strip()
+    if env_dir:
+        return Path(env_dir).expanduser()
+    cwd_data = Path.cwd() / "data"
+    if (cwd_data / "stream_memory.db").exists():
+        return cwd_data
+    pyproject = Path.cwd() / "pyproject.toml"
+    if pyproject.exists():
+        try:
+            if 'name = "stream-memory-manager"' in pyproject.read_text(encoding="utf-8"):
+                return cwd_data
+        except OSError:
+            pass
+    return Path.home() / ".local" / "share" / "stream-memory-manager"
+
+
 @app.callback(invoke_without_command=True)
 def _default_launch_studio(
     ctx: typer.Context,
-    data_dir: Annotated[Path, typer.Option("--data-dir")] = Path.cwd() / "data",
+    data_dir: Annotated[Path, typer.Option("--data-dir")] = _default_data_dir(),
     port: Annotated[int, typer.Option("--port")] = 4319,
     no_browser: Annotated[bool, typer.Option("--no-browser")] = False,
 ) -> None:
@@ -96,10 +121,6 @@ def _default_launch_studio(
 
 
 console = Console(stderr=False)
-
-
-def _default_data_dir() -> Path:
-    return Path.cwd() / "data"
 
 
 def _open_db(data_dir: Path, *, read_only: bool = False) -> Database:
@@ -1047,9 +1068,16 @@ def cmd_harvest(
         ),
     ] = None,
     max_items: Annotated[int, typer.Option("--max-items")] = 40,
+    ingest_after: Annotated[
+        bool,
+        typer.Option(
+            "--ingest/--no-ingest",
+            help="Automatically ingest harvested markdown files into the local SQLite registry",
+        ),
+    ] = True,
     as_json: Annotated[bool, typer.Option("--json")] = False,
 ) -> None:
-    """Harvest read-only, secret-redacted digests from local coding agents into data/harvested/."""
+    """Harvest read-only, secret-redacted digests from local coding agents and optionally ingest them."""
     try:
         selected = [s.strip() for s in sources.split(",") if s.strip()] if sources else None
         res = harvest_local_sources(
@@ -1057,6 +1085,22 @@ def cmd_harvest(
             sources=selected,
             max_items_per_source=max_items,
         )
+        if ingest_after and res.get("written"):
+            ingested_total = 0
+            ingested_files: list[str] = []
+            db = _open_db(data_dir)
+            try:
+                reg = KnowledgeRegistry(db)
+                for item in res["written"]:
+                    p = Path(str(item["output_path"]))
+                    if p.exists():
+                        ires = ingest_file(reg, p)
+                        ingested_total += int(ires.get("records_parsed", 0))
+                        ingested_files.append(str(p))
+            finally:
+                db.close()
+            res["ingested_records"] = ingested_total
+            res["ingested_files"] = ingested_files
         _emit(res, as_json=as_json, title="Local Coding-Agent Harvest Complete")
     except StreamMemoryError as exc:
         _fail(exc, as_json=as_json)
@@ -1068,14 +1112,29 @@ def cmd_harvest_export(
     service: Annotated[str, typer.Option("--service")] = "auto",
     data_dir: Annotated[Path, typer.Option("--data-dir")] = _default_data_dir(),
     max_conversations: Annotated[int, typer.Option("--max-conversations")] = 80,
+    ingest_after: Annotated[
+        bool,
+        typer.Option(
+            "--ingest/--no-ingest",
+            help="Automatically ingest the digested export into the local SQLite registry",
+        ),
+    ] = True,
     as_json: Annotated[bool, typer.Option("--json")] = False,
 ) -> None:
-    """Parse an official ChatGPT, Claude, Gemini, DeepSeek, or T3 JSON/ZIP export into staged Markdown."""
+    """Parse an official ChatGPT, Claude, Gemini, DeepSeek, or T3 JSON/ZIP export and ingest into SQLite."""
     try:
         out = data_dir / "harvested" / f"export_{export_file.stem}.md"
         res = parse_web_export_to_markdown(
             export_file, out, service=service, max_conversations=max_conversations
         )
+        if ingest_after and out.exists():
+            db = _open_db(data_dir)
+            try:
+                reg = KnowledgeRegistry(db)
+                ires = ingest_file(reg, out)
+                res["ingested_records"] = int(ires.get("records_parsed", 0))
+            finally:
+                db.close()
         _emit(res, as_json=as_json, title="Web Export Digested")
     except StreamMemoryError as exc:
         _fail(exc, as_json=as_json)
@@ -1323,9 +1382,17 @@ def cmd_apply_dossiers(
                 "hard_blocked": len(priv["hard_blocked"]),
                 "needs_review": len(priv["needs_review"]),
                 "approved_clean": len(priv["approved_clean"]),
+                "hard_blocked_items": priv["hard_blocked"],
+                "needs_review_items": priv["needs_review"],
             }
             if compile_after:
-                res["compile"] = compile_memory(reg, include_index=include_index)
+                comp = compile_memory(reg, include_index=include_index)
+                res["compile"] = comp
+                if comp.get("skipped_unapproved_eligible", 0) > 0:
+                    res["warning"] = (
+                        f"{comp['skipped_unapproved_eligible']} dossier(s) were paused for privacy review "
+                        "and omitted from compilation; inspect `privacy_summary.needs_review_items`."
+                    )
         finally:
             db.close()
         _emit(res, as_json=as_json, title="Agent-Synthesized Topic Dossiers Applied")
@@ -1397,9 +1464,16 @@ def cmd_reset_memory(
         bool,
         typer.Option(
             "--stale-only",
-            help="Move only stale/orphan notes in Memory that do not match current compiled Dossiers",
+            help="Move stale/superseded (and optionally changed) managed notes out of Memory while keeping in-sync and personal notes untouched",
         ),
     ] = False,
+    include_changed: Annotated[
+        bool,
+        typer.Option(
+            "--include-changed/--no-include-changed",
+            help="With --stale-only, also archive managed notes whose title matches a locally modified dossier so re-push replaces cleanly",
+        ),
+    ] = True,
     data_dir: Annotated[Path, typer.Option("--data-dir")] = _default_data_dir(),
     profile: Annotated[str, typer.Option("--profile")] = "default",
     server_url: Annotated[str, typer.Option("--server-url")] = SANDBAR_OFFICIAL_MCP_URL,
@@ -1453,6 +1527,11 @@ def cmd_reset_memory(
                     )
                 )
                 target_ids = [str(x["remote_id"]) for x in live["stale_in_stream"]]
+                if include_changed:
+                    target_ids.extend(
+                        str(x["remote_id"]) for x in live["changed_local"] if x.get("remote_id")
+                    )
+                target_ids = list(dict.fromkeys(target_ids))
             res = asyncio.run(
                 quarantine_logs_to_archive(
                     adapter,

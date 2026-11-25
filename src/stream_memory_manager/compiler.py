@@ -148,16 +148,38 @@ TAG_LINE_PREFIX_RE = re.compile(
 )
 
 
+MD_HEADING_RE = re.compile(r"^\s{0,3}#{1,6}\s+(?P<text>.+?)\s*#*$")
+MD_BOLD_RE = re.compile(r"\*\*(?P<inner>[^*\n]+?)\*\*")
+
+
 def _clean_voice_prose(body: str) -> str:
-    """Strip robotic `[Confirmed] (2026-11)` / `[Constraint]` tag prefixes for natural Stream voice/text retrieval."""
+    """Format clean, voice- and Stream-Web-friendly plain text (Stream renders raw Markdown literally).
+
+    - Strips robotic `[Confirmed] (2026-11)` / `[Constraint]` tag prefixes.
+    - Converts raw `## Heading` lines to clean plain-text headings and unwraps `**bold**` markers.
+    - Leaves fenced code blocks untouched.
+    """
     out: list[str] = []
+    in_fence = False
     for line in body.splitlines():
+        if line.strip().startswith("```"):
+            in_fence = not in_fence
+            out.append(line)
+            continue
+        if in_fence:
+            out.append(line)
+            continue
         m = TAG_LINE_PREFIX_RE.match(line)
         if m:
             rest = line[m.end() :].strip()
-            out.append(f"{m.group('bullet')}{rest}" if rest else line)
-        else:
-            out.append(line)
+            line = f"{m.group('bullet')}{rest}" if rest else line
+        hm = MD_HEADING_RE.match(line)
+        if hm:
+            heading = MD_BOLD_RE.sub(r"\g<inner>", hm.group("text").strip())
+            out.append(heading if heading.endswith(":") else f"{heading}:")
+            continue
+        cleaned_line = MD_BOLD_RE.sub(r"\g<inner>", line)
+        out.append(cleaned_line)
     return "\n".join(out)
 
 

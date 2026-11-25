@@ -1,6 +1,6 @@
 [project]
 name = "stream-memory-manager"
-version = "0.3.0"
+version = "0.3.1"
 description = "Agent-driven context handoff, consolidation, live Sandbar Stream MCP sync, and Stream Web verification pipeline"
 readme = "README.md"
 license = "MIT"

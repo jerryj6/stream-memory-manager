@@ -2,6 +2,16 @@
 
 All notable changes to **Stream Memory Manager** are documented in this file.
 
+## [0.3.1] — 2026-11-25
+
+### Fixed (Clean-Room Hardening)
+- **Zero-Clone Clean-Room Skill Execution (`SKILL.md`):** Added Stage 0 CLI bootstrap (`uv tool install`) and switched all commands to bare `stream-memory` so `npx skills add` works cleanly in any empty directory with no git clone.
+- **Auto-Ingest on `harvest` & `harvest-export`:** Both commands now automatically ingest written Markdown digests into SQLite (`--ingest/--no-ingest`, default `--ingest`) so `agent-pack` never starts empty.
+- **XDG Default Data Directory (`_default_data_dir`):** Defaults to `~/.local/share/stream-memory-manager` (or `$STREAM_MEMORY_DATA_DIR`, keeping `./data` inside repo checkouts) so running from arbitrary folders never drops un-gitignored DBs into unrelated repos.
+- **Clean Re-Sync Replacement (`reset-memory --stale-only`):** Now archives both `stale_in_stream` and `changed_local` managed notes by default (`--include-changed/--no-include-changed`) while keeping in-sync dossiers and personal Stream voice notes untouched.
+- **Plain-Text Stream Formatting (`compiler.py`):** Converts Markdown `##` headings and `**bold**` markers into clean plain text since Stream Web renders raw Markdown literally.
+- **Privacy & Diagnostics Polish:** Removed 2 leftover project-specific regexes from `privacy.py` and surfaced exact `needs_review_items` / `warning` details in `apply-dossiers --compile`.
+
 ## [0.3.0] — 2026-11-25
 
 ### Added

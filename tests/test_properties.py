@@ -116,7 +116,7 @@ def test_property_semantic_split_always_respects_word_ceiling_and_never_drops_to
             "SSN 123-45-6789",
             "Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1c2VyIn0.signature123456",
             "host.tail999.ts.net",
-            "SANDBAR_STREAM_COMPLETE_HANDOFF",
+            "storageState.json",
             "sk-proj-1234567890abcdefghijklmnop",
         ]
     ),

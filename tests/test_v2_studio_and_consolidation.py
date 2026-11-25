@@ -395,3 +395,45 @@ def test_agent_pack_and_apply_dossiers_atomic_consolidation(tmp_db: Database) ->
     assert res["unmodified_active_ids"] == []
     compile_res = compile_memory(reg, include_index=False)
     assert compile_res["compiled_log_count"] == 1
+
+
+def test_clean_room_plaintext_compiler_and_default_data_dir(
+    tmp_db: Database, tmp_path: Path, monkeypatch: object
+) -> None:
+    """Compiled Stream notes strip raw Markdown ##/** tokens, and default data dir avoids random CWDs."""
+    from stream_memory_manager.cli import _default_data_dir
+
+    reg = KnowledgeRegistry(tmp_db)
+    reg.upsert_record(
+        MemoryRecordInput(
+            logical_id="rec_fmt",
+            title="Engineering Setup",
+            category="ENGINEERING",
+            body=(
+                "## Hardware Stack\n"
+                "- [Confirmed] Uses **M3 Pro** laptop with `uv`.\n"
+                "```python\n"
+                "# keep comments inside code fences\n"
+                "x = 2 ** 3\n"
+                "```"
+            ),
+            inclusion_decision=InclusionDecision.APPROVED,
+        )
+    )
+    compile_memory(reg, include_index=False)
+    log = next(a for a in load_compiled_artifacts(reg) if a.artifact_kind == "log")
+    assert "## Hardware Stack" not in log.body
+    assert "Hardware Stack:" in log.body
+    assert "**M3 Pro**" not in log.body
+    assert "Uses M3 Pro laptop" in log.body
+    assert "x = 2 ** 3" in log.body  # fenced code block preserved untouched
+
+    # Verify STREAM_MEMORY_DATA_DIR override & clean-room XDG default outside repo checkout
+    assert hasattr(monkeypatch, "setenv") and hasattr(monkeypatch, "chdir")
+    monkeypatch.setenv("STREAM_MEMORY_DATA_DIR", str(tmp_path / "custom_env_dir"))
+    assert _default_data_dir() == tmp_path / "custom_env_dir"
+    monkeypatch.delenv("STREAM_MEMORY_DATA_DIR", raising=False)
+    empty_cwd = tmp_path / "clean_empty_dir"
+    empty_cwd.mkdir()
+    monkeypatch.chdir(empty_cwd)
+    assert _default_data_dir() == Path.home() / ".local" / "share" / "stream-memory-manager"
