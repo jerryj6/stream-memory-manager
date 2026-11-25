@@ -61,6 +61,7 @@ class RemoteLog:
     body: str
     folder_id: str | None = None
     last_update_ts: int | None = None
+    raw_last_update_ts: float | int | None = None
     search_index_status: str | None = None
     created_via_mcp: bool | None = None
 
@@ -811,6 +812,7 @@ class SandbarMCPAdapter:
             body=parsed.body or body,
             folder_id=parsed.folder_id or folder_id,
             last_update_ts=parsed.last_update_ts,
+            raw_last_update_ts=parsed.raw_last_update_ts,
             search_index_status=idx_status,
             created_via_mcp=parsed.created_via_mcp,
         )
@@ -844,8 +846,8 @@ class SandbarMCPAdapter:
         self,
         *,
         artifact_id: str,
-        folder_id: str,
-        expected_last_update_ts: int | None = None,
+        folder_id: str | None,
+        expected_last_update_ts: float | int | None = None,
     ) -> RemoteLog:
         props = self._tool_props("move_log")
         id_param = "artifact_id" if "artifact_id" in props else "id"
@@ -908,6 +910,20 @@ def _parse_remote_log(item: dict[str, Any]) -> RemoteLog:
     else:
         body_str = str(raw_content or "")
 
+    raw_ts_val: float | int | None = None
+    if item.get("lastUpdateUnixTs") is not None:
+        raw_ts_val = (
+            float(item["lastUpdateUnixTs"])
+            if isinstance(item["lastUpdateUnixTs"], float)
+            else int(item["lastUpdateUnixTs"])
+        )
+    elif item.get("last_update_ts") is not None:
+        raw_ts_val = (
+            float(item["last_update_ts"])
+            if isinstance(item["last_update_ts"], float)
+            else int(item["last_update_ts"])
+        )
+
     return RemoteLog(
         artifact_id=str(item.get("id") or item.get("artifact_id") or ""),
         title=raw_title,
@@ -917,11 +933,279 @@ def _parse_remote_log(item: dict[str, Any]) -> RemoteLog:
             if item.get("folder_id")
             else (str(item["folderId"]) if item.get("folderId") else None)
         ),
-        last_update_ts=(
-            int(item["lastUpdateUnixTs"])
-            if item.get("lastUpdateUnixTs") is not None
-            else (int(item["last_update_ts"]) if item.get("last_update_ts") is not None else None)
-        ),
+        last_update_ts=int(raw_ts_val) if raw_ts_val is not None else None,
+        raw_last_update_ts=raw_ts_val,
         search_index_status=item.get("searchIndexStatus"),
         created_via_mcp=via_mcp,
     )
+
+
+STREAM_WEB_URL = "https://stream.sandbar.com"
+DEFAULT_ARCHIVE_FOLDER_NAME = "Memory Archive"
+DEFAULT_ARCHIVE_INSTRUCTION = (
+    "Archived old memory notes pending deletion in Stream Web. Ignore in conversations."
+)
+
+
+async def inspect_live_memory_state(
+    adapter: SandbarMCPAdapter,
+    compiled_logs: list[Any],
+    *,
+    target_folder_name: str = "Memory",
+    archive_folder_name: str = DEFAULT_ARCHIVE_FOLDER_NAME,
+    hydrate: bool = True,
+) -> dict[str, Any]:
+    """Inspect live Sandbar Memory & Memory Archive folders read-only and diff vs local compiled Logs."""
+    from stream_memory_manager.compiler import normalize_remote_text
+    from stream_memory_manager.security import canonical_json_hash
+
+    caps = adapter.capabilities
+    if caps is None:
+        caps = await adapter.discover_capabilities()
+
+    folders = await adapter.list_folders() if caps.supports_list_folders else []
+    mem_folder = next((f for f in folders if f.name == target_folder_name), None)
+    arch_folder = next((f for f in folders if f.name == archive_folder_name), None)
+
+    live_mem_logs: list[RemoteLog] = []
+    if mem_folder is not None and caps.supports_list_artifacts:
+        listed = await adapter.list_artifacts(folder_id=mem_folder.folder_id)
+        if hydrate and caps.supports_get_artifact:
+            for rl in listed:
+                if rl.artifact_id and (not rl.body.strip() or not rl.title.strip()):
+                    full = await adapter.get_artifact(rl.artifact_id)
+                    live_mem_logs.append(full if full is not None else rl)
+                else:
+                    live_mem_logs.append(rl)
+        else:
+            live_mem_logs = listed
+
+    archive_items: list[RemoteLog] = []
+    if arch_folder is not None and caps.supports_list_artifacts:
+        archive_items = await adapter.list_artifacts(folder_id=arch_folder.folder_id)
+
+    # Index remote Memory logs by normalized hash & normalized title
+    remote_by_hash: dict[str, RemoteLog] = {}
+    remote_by_title: dict[str, RemoteLog] = {}
+    for rl in live_mem_logs:
+        nh = canonical_json_hash(
+            {
+                "title": normalize_remote_text(rl.title),
+                "body": normalize_remote_text(rl.body),
+            }
+        )
+        remote_by_hash[nh] = rl
+        nt = normalize_remote_text(rl.title)
+        if nt:
+            remote_by_title[nt] = rl
+
+    matched_remote_ids: set[str] = set()
+    in_sync: list[dict[str, Any]] = []
+    changed_local: list[dict[str, Any]] = []
+    new_local: list[dict[str, Any]] = []
+
+    for art in compiled_logs:
+        nh = str(art.normalized_payload_hash)
+        nt = normalize_remote_text(str(art.title))
+        if nh in remote_by_hash:
+            rl = remote_by_hash[nh]
+            matched_remote_ids.add(rl.artifact_id)
+            in_sync.append(
+                {
+                    "artifact_key": art.artifact_key,
+                    "logical_id": art.logical_id,
+                    "title": art.title,
+                    "word_count": art.conservative_word_count,
+                    "remote_id": rl.artifact_id,
+                    "status": "IN_SYNC",
+                }
+            )
+        elif nt in remote_by_title:
+            rl = remote_by_title[nt]
+            matched_remote_ids.add(rl.artifact_id)
+            changed_local.append(
+                {
+                    "artifact_key": art.artifact_key,
+                    "logical_id": art.logical_id,
+                    "title": art.title,
+                    "word_count": art.conservative_word_count,
+                    "remote_id": rl.artifact_id,
+                    "status": "CHANGED_LOCAL",
+                }
+            )
+        else:
+            new_local.append(
+                {
+                    "artifact_key": art.artifact_key,
+                    "logical_id": art.logical_id,
+                    "title": art.title,
+                    "word_count": art.conservative_word_count,
+                    "remote_id": None,
+                    "status": "NEW_LOCAL",
+                }
+            )
+
+    stale_in_stream: list[dict[str, Any]] = []
+    for rl in live_mem_logs:
+        if rl.artifact_id and rl.artifact_id not in matched_remote_ids:
+            stale_in_stream.append(
+                {
+                    "remote_id": rl.artifact_id,
+                    "title": rl.title or "(Untitled Note)",
+                    "preview": rl.body[:160].replace("\n", " "),
+                    "last_update_ts": rl.raw_last_update_ts or rl.last_update_ts,
+                    "status": "STALE_IN_STREAM",
+                }
+            )
+
+    return {
+        "stream_web_url": STREAM_WEB_URL,
+        "target_folder": target_folder_name,
+        "folder_id": mem_folder.folder_id if mem_folder else None,
+        "folder_instruction": mem_folder.instruction if mem_folder else None,
+        "archive_folder": archive_folder_name,
+        "archive_folder_id": arch_folder.folder_id if arch_folder else None,
+        "live_memory_count": len(live_mem_logs),
+        "archive_count": len(archive_items),
+        "in_sync": in_sync,
+        "new_local": new_local,
+        "changed_local": changed_local,
+        "stale_in_stream": stale_in_stream,
+        "supports_move": bool(caps.supports_move_log),
+        "supports_delete": bool(caps.supports_delete_log),
+    }
+
+
+async def quarantine_logs_to_archive(
+    adapter: SandbarMCPAdapter,
+    *,
+    target_folder_name: str = "Memory",
+    archive_folder_name: str = DEFAULT_ARCHIVE_FOLDER_NAME,
+    artifact_ids: list[str] | None = None,
+    progress_cb: Any | None = None,
+) -> dict[str, Any]:
+    """Safely quarantine stale/old (or all) Memory Logs into `Memory Archive` via official MCP `set_note_folder`.
+
+    Because Sandbar MCP intentionally omits `delete_note`, moving obsolete Logs into a dedicated
+    `Memory Archive` folder instantly resets `Memory` to a clean slate via 100% official MCP
+    and isolates old items for easy permanent deletion inside Stream Web (`stream.sandbar.com`).
+    """
+    caps = adapter.capabilities
+    if caps is None:
+        caps = await adapter.discover_capabilities()
+    if not caps.supports_move_log:
+        raise CapabilityUnsupportedError(
+            "Connected Sandbar MCP server does not advertise set_note_folder / move_log."
+        )
+
+    folders = await adapter.list_folders()
+    mem_folder = next((f for f in folders if f.name == target_folder_name), None)
+    if mem_folder is None:
+        return {
+            "moved_count": 0,
+            "failed_count": 0,
+            "archive_folder_id": None,
+            "moved_ids": [],
+            "errors": [],
+            "stream_web_url": STREAM_WEB_URL,
+        }
+
+    # Resolve or create `Memory Archive` folder cleanly
+    arch_folder = next((f for f in folders if f.name == archive_folder_name), None)
+    if arch_folder is None:
+        arch_folder = await adapter.create_folder(
+            archive_folder_name, instruction=DEFAULT_ARCHIVE_INSTRUCTION
+        )
+
+    mem_items = await adapter.list_artifacts(folder_id=mem_folder.folder_id)
+    if artifact_ids is not None:
+        want = set(artifact_ids)
+        targets = [rl for rl in mem_items if rl.artifact_id in want]
+    else:
+        targets = list(mem_items)
+
+    moved_ids: list[str] = []
+    errors: list[dict[str, str]] = []
+    total = len(targets)
+
+    for idx, rl in enumerate(targets, start=1):
+        ts = rl.raw_last_update_ts if rl.raw_last_update_ts is not None else rl.last_update_ts
+        if ts is None and caps.supports_get_artifact:
+            fresh = await adapter.get_artifact(rl.artifact_id)
+            if fresh is not None:
+                ts = (
+                    fresh.raw_last_update_ts
+                    if fresh.raw_last_update_ts is not None
+                    else fresh.last_update_ts
+                )
+        try:
+            await adapter.move_log_to_folder(
+                artifact_id=rl.artifact_id,
+                folder_id=arch_folder.folder_id,
+                expected_last_update_ts=ts,
+            )
+            moved_ids.append(rl.artifact_id)
+            if progress_cb is not None:
+                progress_cb(
+                    {
+                        "phase": "quarantine",
+                        "current": idx,
+                        "total": total,
+                        "artifact_id": rl.artifact_id,
+                        "title": rl.title or rl.artifact_id,
+                        "status": "moved",
+                    }
+                )
+        except StreamMemoryError as exc:
+            # One safe optimistic-concurrency refresh retry on timestamp conflict
+            if exc.error_class == ErrorClass.CONFLICT_ERROR and caps.supports_get_artifact:
+                fresh = await adapter.get_artifact(rl.artifact_id)
+                if fresh is not None:
+                    fresh_ts = (
+                        fresh.raw_last_update_ts
+                        if fresh.raw_last_update_ts is not None
+                        else fresh.last_update_ts
+                    )
+                    try:
+                        await adapter.move_log_to_folder(
+                            artifact_id=rl.artifact_id,
+                            folder_id=arch_folder.folder_id,
+                            expected_last_update_ts=fresh_ts,
+                        )
+                        moved_ids.append(rl.artifact_id)
+                        if progress_cb is not None:
+                            progress_cb(
+                                {
+                                    "phase": "quarantine",
+                                    "current": idx,
+                                    "total": total,
+                                    "artifact_id": rl.artifact_id,
+                                    "title": fresh.title or rl.artifact_id,
+                                    "status": "moved",
+                                }
+                            )
+                        continue
+                    except StreamMemoryError as retry_exc:
+                        exc = retry_exc
+            errors.append({"artifact_id": rl.artifact_id, "error": redact_secrets(str(exc))})
+            if progress_cb is not None:
+                progress_cb(
+                    {
+                        "phase": "quarantine",
+                        "current": idx,
+                        "total": total,
+                        "artifact_id": rl.artifact_id,
+                        "status": "error",
+                        "error": redact_secrets(str(exc)),
+                    }
+                )
+
+    return {
+        "moved_count": len(moved_ids),
+        "failed_count": len(errors),
+        "archive_folder": archive_folder_name,
+        "archive_folder_id": arch_folder.folder_id,
+        "moved_ids": moved_ids,
+        "errors": errors,
+        "stream_web_url": STREAM_WEB_URL,
+    }

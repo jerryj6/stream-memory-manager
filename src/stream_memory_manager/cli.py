@@ -25,6 +25,7 @@ from stream_memory_manager.capabilities import (
     default_offline_documented_capabilities,
 )
 from stream_memory_manager.compiler import compile_memory, load_compiled_artifacts
+from stream_memory_manager.consolidator import analyze_corpus, merge_records
 from stream_memory_manager.db import Database, restore_backup
 from stream_memory_manager.evaluator import (
     generate_native_evaluation_protocol,
@@ -39,7 +40,12 @@ from stream_memory_manager.harvesters import (
     parse_web_export_to_markdown,
 )
 from stream_memory_manager.ingestion import ingest_file
-from stream_memory_manager.mcp_adapter import SandbarMCPAdapter
+from stream_memory_manager.mcp_adapter import (
+    DEFAULT_ARCHIVE_FOLDER_NAME,
+    SandbarMCPAdapter,
+    inspect_live_memory_state,
+    quarantine_logs_to_archive,
+)
 from stream_memory_manager.models import (
     ErrorClass,
     ExecutionMode,
@@ -65,11 +71,24 @@ from stream_memory_manager.status import compute_system_status, run_doctor
 
 app = typer.Typer(
     name="stream-memory",
-    help="Local-first personal knowledge manager and fail-closed Sandbar Stream MCP client.",
-    no_args_is_help=True,
+    help="Stream Memory Studio — local-first AI context migrator & Sandbar Stream MCP manager. Run with no args to launch the Studio UI.",
+    no_args_is_help=False,
 )
 auth_app = typer.Typer(help="Manage legitimate OAuth 2.1 Sandbar connections.")
 app.add_typer(auth_app, name="auth")
+
+
+@app.callback(invoke_without_command=True)
+def _default_launch_studio(
+    ctx: typer.Context,
+    data_dir: Annotated[Path, typer.Option("--data-dir")] = Path.cwd() / "data",
+    port: Annotated[int, typer.Option("--port")] = 4319,
+    no_browser: Annotated[bool, typer.Option("--no-browser")] = False,
+) -> None:
+    """Launch Stream Memory Studio automatically when invoked with no subcommand."""
+    if ctx.invoked_subcommand is None:
+        cmd_ui(data_dir=data_dir, port=port, open_browser=not no_browser)
+
 
 console = Console(stderr=False)
 
@@ -1145,19 +1164,270 @@ def cmd_web_prompts(
         _fail(exc, as_json=as_json)
 
 
+@app.command("consolidate")
+def cmd_consolidate(
+    data_dir: Annotated[Path, typer.Option("--data-dir")] = _default_data_dir(),
+    similarity: Annotated[float, typer.Option("--similarity")] = 0.24,
+    as_json: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    """Analyze active records to surface overlapping merge candidates, sparse fragments, and meta-boilerplate."""
+    try:
+        db = _open_db(data_dir)
+        try:
+            reg = KnowledgeRegistry(db)
+            res = analyze_corpus(reg, similarity_threshold=similarity)
+        finally:
+            db.close()
+        _emit(res, as_json=as_json, title="Corpus Consolidation & Hygiene Analysis")
+    except StreamMemoryError as exc:
+        _fail(exc, as_json=as_json)
+
+
+@app.command("merge")
+def cmd_merge(
+    record_ids: Annotated[
+        list[str], typer.Argument(help="Two or more logical_ids to consolidate into one dossier")
+    ],
+    title: Annotated[str, typer.Option("--title", help="Title for the unified Topic Dossier")],
+    category: Annotated[str | None, typer.Option("--category")] = None,
+    body_file: Annotated[
+        Path | None,
+        typer.Option("--body-file", help="Optional path to curated merged Markdown body"),
+    ] = None,
+    data_dir: Annotated[Path, typer.Option("--data-dir")] = _default_data_dir(),
+    as_json: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    """Merge 2+ overlapping records into ONE dense canonical Topic Dossier and supersede absorbed fragments."""
+    try:
+        merged_body = body_file.read_text(encoding="utf-8") if body_file else None
+        db = _open_db(data_dir)
+        try:
+            reg = KnowledgeRegistry(db)
+            res = merge_records(
+                reg,
+                record_ids,
+                target_title=title,
+                target_category=category,
+                merged_body=merged_body,
+                approve=True,
+            )
+            evaluate_registry_privacy(reg)
+        finally:
+            db.close()
+        _emit(res, as_json=as_json, title="Topic Dossier Merged")
+    except StreamMemoryError as exc:
+        _fail(exc, as_json=as_json)
+
+
+@app.command("inspect-live")
+def cmd_inspect_live(
+    data_dir: Annotated[Path, typer.Option("--data-dir")] = _default_data_dir(),
+    profile: Annotated[str, typer.Option("--profile")] = "default",
+    server_url: Annotated[str, typer.Option("--server-url")] = SANDBAR_OFFICIAL_MCP_URL,
+    folder: Annotated[str, typer.Option("--folder")] = "Memory",
+    archive_folder: Annotated[str, typer.Option("--archive-folder")] = DEFAULT_ARCHIVE_FOLDER_NAME,
+    allow_localhost_http: Annotated[bool, typer.Option("--allow-localhost-http")] = False,
+    use_keyring: Annotated[bool, typer.Option("--use-keyring/--file-token-store")] = True,
+    as_json: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    """Inspect live Sandbar Memory & Memory Archive folders read-only and diff against compiled local Dossiers."""
+    try:
+        db = _open_db(data_dir)
+        try:
+            reg = KnowledgeRegistry(db)
+            compiled_logs = [a for a in load_compiled_artifacts(reg) if a.artifact_kind == "log"]
+            storage = SecureTokenStorage(
+                profile=profile,
+                server_url=server_url,
+                fallback_dir=data_dir / "credentials",
+                use_keyring=use_keyring,
+            )
+            sched = AccountRateScheduler(
+                db, _rate_limit_key(db, server_url=server_url, profile=profile)
+            )
+            adapter = SandbarMCPAdapter(
+                server_url=server_url,
+                scheduler=sched,
+                storage=storage,
+                allow_localhost_http=allow_localhost_http,
+                expected_mode=ExecutionMode.LIVE,
+                capabilities=CapabilityStore(db).get_latest(server_url),
+            )
+            res = asyncio.run(
+                inspect_live_memory_state(
+                    adapter,
+                    compiled_logs,
+                    target_folder_name=folder,
+                    archive_folder_name=archive_folder,
+                )
+            )
+        finally:
+            db.close()
+        _emit(res, as_json=as_json, title="Live Sandbar Stream Memory Diff")
+    except StreamMemoryError as exc:
+        _fail(exc, as_json=as_json)
+
+
+@app.command("reset-memory")
+def cmd_reset_memory(
+    confirm_reset: Annotated[
+        bool,
+        typer.Option(
+            "--confirm-reset",
+            help="Required explicit confirmation to move live Memory notes into Memory Archive via official MCP",
+        ),
+    ] = False,
+    stale_only: Annotated[
+        bool,
+        typer.Option(
+            "--stale-only",
+            help="Move only stale/orphan notes in Memory that do not match current compiled Dossiers",
+        ),
+    ] = False,
+    data_dir: Annotated[Path, typer.Option("--data-dir")] = _default_data_dir(),
+    profile: Annotated[str, typer.Option("--profile")] = "default",
+    server_url: Annotated[str, typer.Option("--server-url")] = SANDBAR_OFFICIAL_MCP_URL,
+    folder: Annotated[str, typer.Option("--folder")] = "Memory",
+    archive_folder: Annotated[str, typer.Option("--archive-folder")] = DEFAULT_ARCHIVE_FOLDER_NAME,
+    allow_localhost_http: Annotated[bool, typer.Option("--allow-localhost-http")] = False,
+    use_keyring: Annotated[bool, typer.Option("--use-keyring/--file-token-store")] = True,
+    as_json: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    """Safely quarantine stale or ALL live Memory notes into `Memory Archive` via official MCP `set_note_folder`."""
+    try:
+        if not confirm_reset:
+            raise StreamMemoryError(
+                "Refusing to quarantine live Memory notes without explicit `--confirm-reset`.",
+                error_class=ErrorClass.VALIDATION_PERMANENT,
+                exit_code=ExitCode.APPROVAL_REQUIRED,
+            )
+        db = _open_db(data_dir)
+        try:
+            reg = KnowledgeRegistry(db)
+            storage = SecureTokenStorage(
+                profile=profile,
+                server_url=server_url,
+                fallback_dir=data_dir / "credentials",
+                use_keyring=use_keyring,
+            )
+            sched = AccountRateScheduler(
+                db, _rate_limit_key(db, server_url=server_url, profile=profile)
+            )
+            adapter = SandbarMCPAdapter(
+                server_url=server_url,
+                scheduler=sched,
+                storage=storage,
+                allow_localhost_http=allow_localhost_http,
+                expected_mode=ExecutionMode.LIVE,
+                capabilities=CapabilityStore(db).get_latest(server_url),
+            )
+            target_ids: list[str] | None = None
+            if stale_only:
+                compiled_logs = [
+                    a for a in load_compiled_artifacts(reg) if a.artifact_kind == "log"
+                ]
+                live = asyncio.run(
+                    inspect_live_memory_state(
+                        adapter,
+                        compiled_logs,
+                        target_folder_name=folder,
+                        archive_folder_name=archive_folder,
+                    )
+                )
+                target_ids = [str(x["remote_id"]) for x in live["stale_in_stream"]]
+            res = asyncio.run(
+                quarantine_logs_to_archive(
+                    adapter,
+                    target_folder_name=folder,
+                    archive_folder_name=archive_folder,
+                    artifact_ids=target_ids,
+                )
+            )
+        finally:
+            db.close()
+        _emit(res, as_json=as_json, title="Live Memory Quarantine Complete")
+    except StreamMemoryError as exc:
+        _fail(exc, as_json=as_json)
+
+
+@app.command("search-live")
+def cmd_search_live(
+    query: Annotated[
+        str, typer.Argument(help="Natural-language query to test against live Stream Memory")
+    ],
+    data_dir: Annotated[Path, typer.Option("--data-dir")] = _default_data_dir(),
+    profile: Annotated[str, typer.Option("--profile")] = "default",
+    server_url: Annotated[str, typer.Option("--server-url")] = SANDBAR_OFFICIAL_MCP_URL,
+    folder: Annotated[str, typer.Option("--folder")] = "Memory",
+    allow_localhost_http: Annotated[bool, typer.Option("--allow-localhost-http")] = False,
+    use_keyring: Annotated[bool, typer.Option("--use-keyring/--file-token-store")] = True,
+    as_json: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    """Test live conversational retrieval against your Sandbar Stream Memory folder."""
+    try:
+        db = _open_db(data_dir)
+        try:
+            storage = SecureTokenStorage(
+                profile=profile,
+                server_url=server_url,
+                fallback_dir=data_dir / "credentials",
+                use_keyring=use_keyring,
+            )
+            sched = AccountRateScheduler(
+                db, _rate_limit_key(db, server_url=server_url, profile=profile)
+            )
+            adapter = SandbarMCPAdapter(
+                server_url=server_url,
+                scheduler=sched,
+                storage=storage,
+                allow_localhost_http=allow_localhost_http,
+                expected_mode=ExecutionMode.LIVE,
+                capabilities=CapabilityStore(db).get_latest(server_url),
+            )
+
+            async def _run() -> dict[str, Any]:
+                if adapter.capabilities is None:
+                    caps = await adapter.discover_capabilities()
+                    CapabilityStore(db).save_snapshot(caps)
+                folders = await adapter.list_folders()
+                mem = next((f for f in folders if f.name == folder), None)
+                hits = await adapter.search_logs(query, folder_id=mem.folder_id if mem else None)
+                return {
+                    "query": query,
+                    "hit_count": len(hits),
+                    "hits": [
+                        {
+                            "rank": i,
+                            "artifact_id": h.artifact_id,
+                            "title": h.title,
+                            "preview": h.body[:200].replace("\n", " "),
+                        }
+                        for i, h in enumerate(hits, start=1)
+                    ],
+                }
+
+            res = asyncio.run(_run())
+        finally:
+            db.close()
+        _emit(res, as_json=as_json, title=f"Live Stream Search: {query}")
+    except StreamMemoryError as exc:
+        _fail(exc, as_json=as_json)
+
+
 @app.command("ui")
 def cmd_ui(
     data_dir: Annotated[Path, typer.Option("--data-dir")] = _default_data_dir(),
     port: Annotated[int, typer.Option("--port")] = 4319,
+    open_browser: Annotated[bool, typer.Option("--open/--no-browser")] = False,
 ) -> None:
-    """Launch ephemeral local staging & review web UI strictly on http://127.0.0.1:<port>/view."""
+    """Launch Stream Memory Studio (unified 4-tab local web app) strictly on http://127.0.0.1:<port>/view."""
     from stream_memory_manager.web_ui import run_staging_ui
 
     ensure_private_dir(data_dir)
     _open_db(data_dir).close()
-    typer.echo(f"Starting Stream Memory Manager local review UI at http://127.0.0.1:{port}/view")
-    typer.echo("Press Ctrl+C to stop. Bound strictly to 127.0.0.1 (no remote writes from UI).")
-    run_staging_ui(data_dir, port=port)
+    typer.echo(f"Starting Stream Memory Studio at http://127.0.0.1:{port}/view")
+    typer.echo("Bound strictly to 127.0.0.1 (CSRF-protected). Press Ctrl+C to stop.")
+    run_staging_ui(data_dir, port=port, open_browser=open_browser)
 
 
 def main() -> None:

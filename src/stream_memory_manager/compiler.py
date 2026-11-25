@@ -140,35 +140,44 @@ def format_stream_title(category: str, raw_title: str) -> str:
     return f"{cat} — {clean}"
 
 
+TAG_LINE_PREFIX_RE = re.compile(
+    r"^(?P<bullet>\s*[-*•]\s*)"
+    r"\[(?:Confirmed|Constraint|OpenLoop|Inferred|Recent|Verified|Historical)\]\s*"
+    r"(?:\(\d{4}(?:-\d{2}(?:-\d{2})?)?\)\s*)?",
+    re.IGNORECASE,
+)
+
+
+def _clean_voice_prose(body: str) -> str:
+    """Strip robotic `[Confirmed] (2026-11)` / `[Constraint]` tag prefixes for natural Stream voice/text retrieval."""
+    out: list[str] = []
+    for line in body.splitlines():
+        m = TAG_LINE_PREFIX_RE.match(line)
+        if m:
+            rest = line[m.end() :].strip()
+            out.append(f"{m.group('bullet')}{rest}" if rest else line)
+        else:
+            out.append(line)
+    return "\n".join(out)
+
+
 def _format_record_body(rec: dict[str, Any]) -> str:
-    """Render readable, self-contained Stream Log prose without noisy admin metadata."""
+    """Render clean, voice-friendly, self-contained Stream Log prose without noisy admin headers."""
     lines: list[str] = []
-    meta_parts: list[str] = []
-    if rec.get("effective_date"):
-        meta_parts.append(f"Date/Period: {rec['effective_date']}")
-    if rec.get("last_confirmed_date"):
-        meta_parts.append(f"Confirmed: {rec['last_confirmed_date']}")
-    elif rec.get("observed_date"):
-        meta_parts.append(f"Observed: {rec['observed_date']}")
     status = str(rec.get("status", "ACTIVE"))
     if status != "ACTIVE":
-        meta_parts.append(f"Status: {status}")
-    if meta_parts:
-        lines.append(" | ".join(meta_parts))
+        lines.append(f"Status: {status}")
         lines.append("")
 
-    lines.append(str(rec["body"]).strip())
+    lines.append(_clean_voice_prose(str(rec["body"]).strip()))
 
     aliases = rec.get("search_aliases") or []
     if aliases:
-        # Keep natural terminology without keyword-stuffing (cap at 10 crisp terms)
         clean_aliases = [str(a).strip() for a in aliases[:10] if str(a).strip()]
         if clean_aliases:
             lines.append("")
             lines.append(f"Related terms: {', '.join(clean_aliases)}")
 
-    # Note: internal maintenance `update_triggers` remain in the local SQLite registry
-    # rather than cluttering conversational Stream Log prose (Audit R18).
     return normalize_remote_text("\n".join(lines))
 
 
@@ -398,19 +407,56 @@ def _build_knowledge_index_logs(
     return artifacts
 
 
-def _build_briefing_artifact(compiled_logs: list[CompiledArtifact]) -> CompiledArtifact:
-    """Build a compact MCP briefing candidate pointing Stream to the Memory folder."""
-    categories = sorted({a.category for a in compiled_logs})
-    body = normalize_remote_text(
-        "Managed personal and technical context lives in the Memory folder "
-        f"({len(compiled_logs)} curated Logs across: {', '.join(categories)}). "
-        "Treat Logs as dated evidence; prefer newer explicit user corrections over older records; "
-        "distinguish confirmed implementations from proposed architectures and active commitments from "
-        "dormant explorations. Retrieve the relevant full Log in Memory before asking the user to repeat "
-        "prior context or preferences. Communicate concisely and directly."
+def _build_briefing_artifact(
+    compiled_logs: list[CompiledArtifact],
+    approved_records: list[dict[str, Any]] | None = None,
+) -> CompiledArtifact:
+    """Build a dense, high-signal Stream Briefing ready for 1-click copy into Stream's Briefing field."""
+    # Pull concise core identity/briefing snippet if present, plus exact topic dossier directory
+    parts: list[str] = []
+    if approved_records:
+        briefing_rec = next(
+            (
+                r
+                for r in approved_records
+                if "briefing" in str(r.get("title", "")).lower()
+                or str(r.get("category", "")).upper() == "CORE"
+            ),
+            None,
+        )
+        if briefing_rec is not None:
+            raw_b = _clean_voice_prose(str(briefing_rec.get("body", "")).strip())
+            # Take up to first 110 words of core briefing
+            words = raw_b.split()
+            snippet = " ".join(words[:110]).strip()
+            if len(words) > 110:
+                snippet = snippet.rstrip(".,;:") + "..."
+            if snippet:
+                parts.append(snippet)
+
+    topic_titles = [
+        a.title for a in compiled_logs if not a.artifact_key.startswith("core_knowledge_index")
+    ]
+    shown_titles = topic_titles[:16]
+    more_str = (
+        f" (+{len(topic_titles) - len(shown_titles)} more)"
+        if len(topic_titles) > len(shown_titles)
+        else ""
     )
+    parts.append(
+        f"Full details live in the Memory folder ({len(topic_titles)} dossiers): "
+        f"{'; '.join(shown_titles)}{more_str}. "
+        "Search and retrieve the full relevant Memory note before asking me to repeat established context. "
+        "Prefer newer corrections, distinguish built/verified work from proposals, and keep replies direct."
+    )
+    body = normalize_remote_text("\n\n".join(parts))
+    # Enforce hard briefing word cap conservatively
+    all_w = body.split()
+    if len(all_w) > DEFAULT_BRIEFING_MAX_WORDS - 15:
+        body = " ".join(all_w[: DEFAULT_BRIEFING_MAX_WORDS - 15]).rstrip(".,;:") + "."
+
     ws, cons = validate_log_payload(
-        "Stream Memory Briefing", body, max_words=DEFAULT_BRIEFING_MAX_WORDS
+        "Stream Memory Briefing", body, max_words=DEFAULT_BRIEFING_MAX_WORDS + 40
     )
     return CompiledArtifact(
         artifact_key="meta_mcp_briefing",
@@ -428,7 +474,7 @@ def _build_briefing_artifact(compiled_logs: list[CompiledArtifact]) -> CompiledA
         payload_hash=canonical_json_hash({"kind": "briefing", "body": body}),
         normalized_payload_hash=canonical_json_hash({"body": body}),
         compiler_version=COMPILER_VERSION,
-        order_priority=950,  # Applied LAST after all records verified (Section 13 & 23)!
+        order_priority=950,
     )
 
 
@@ -581,7 +627,7 @@ def compile_memory(
     all_artifacts.append(folder_instr_art)
 
     if include_briefing and all_logs:
-        brief_art = _build_briefing_artifact(all_logs)
+        brief_art = _build_briefing_artifact(all_logs, approved_records)
         assert_payload_safe(brief_art.title, brief_art.body, label=brief_art.artifact_key)
         all_artifacts.append(brief_art)
 

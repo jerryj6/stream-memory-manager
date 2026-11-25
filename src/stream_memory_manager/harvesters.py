@@ -580,6 +580,35 @@ def detect_local_sources(*, home: Path | None = None) -> dict[str, Any]:
         else ("installed but not logged in" if gh_bin else "not installed"),
     )
 
+    # 12. Local Project Workspaces (READMEs + tech stacks — strictly read-only, skips secrets/.env)
+    proj_roots = [
+        p
+        for p in (
+            h / "Projects",
+            h / "Developer",
+            h / "Code",
+            h / "src",
+            h / "workspace",
+            h / ".gemini" / "antigravity" / "scratch",
+        )
+        if p.exists() and p.is_dir()
+    ]
+    git_repos: list[Path] = []
+    for root in proj_roots:
+        try:
+            for child in sorted(root.iterdir()):
+                if child.is_dir() and not child.name.startswith(".") and (child / ".git").exists():
+                    git_repos.append(child)
+        except OSError:
+            continue
+    _add(
+        "local_projects",
+        "Local Git Repositories (README & Tech Stack)",
+        proj_roots,
+        len(git_repos),
+        f"{len(git_repos)} local git repo(s) across {len(proj_roots)} workspace dir(s)",
+    )
+
     return {
         "detected_at": utc_now_iso(),
         "home": str(h),
@@ -592,8 +621,8 @@ def detect_local_sources(*, home: Path | None = None) -> dict[str, Any]:
 def _extract_jsonl_user_messages(
     jsonl_path: Path,
     *,
-    max_lines: int = 200,
-    max_chars_per_msg: int = 240,
+    max_lines: int = 300,
+    max_chars_per_msg: int = 600,
 ) -> list[str]:
     """Read only user-authored prompts from JSONL transcripts (Antigravity/Codex/Claude Code)."""
     msgs: list[str] = []
@@ -871,6 +900,55 @@ def harvest_local_sources(
                 except Exception as exc:
                     logging.getLogger(__name__).debug("GitHub repo list skipped: %s", exc)
 
+        elif sid == "local_projects":
+            lines.append("## Local Git Repositories (README & Tech Stack)")
+            lines.append("")
+            repos_found: list[Path] = []
+            for raw_p in info["paths"]:
+                root_p = Path(raw_p)
+                if not root_p.is_dir():
+                    continue
+                try:
+                    for child in sorted(root_p.iterdir()):
+                        if (
+                            child.is_dir()
+                            and not child.name.startswith(".")
+                            and (child / ".git").exists()
+                        ):
+                            repos_found.append(child)
+                except OSError:
+                    continue
+            repos_found.sort(key=lambda d: d.stat().st_mtime, reverse=True)
+            for repo_dir in repos_found[:max_items_per_source]:
+                stack_tags: list[str] = []
+                if (repo_dir / "pyproject.toml").exists():
+                    stack_tags.append("Python")
+                if (repo_dir / "package.json").exists():
+                    stack_tags.append("TypeScript/JS")
+                if (repo_dir / "Cargo.toml").exists():
+                    stack_tags.append("Rust")
+                if (repo_dir / "Package.swift").exists():
+                    stack_tags.append("Swift")
+                if (repo_dir / "go.mod").exists():
+                    stack_tags.append("Go")
+                summary = ""
+                for readme_name in ("README.md", "readme.md", "README.txt"):
+                    rp = repo_dir / readme_name
+                    if rp.exists() and rp.is_file() and _is_safe_local_path(rp):
+                        raw_rd = redact_secrets(rp.read_text(encoding="utf-8", errors="ignore"))
+                        para = " ".join(
+                            ln.strip()
+                            for ln in raw_rd.splitlines()[:25]
+                            if ln.strip() and not ln.strip().startswith("![")
+                        )
+                        summary = para[:420]
+                        break
+                stack_str = f" [{', '.join(stack_tags)}]" if stack_tags else ""
+                lines.append(
+                    f"- **{repo_dir.name}**{stack_str}: {summary or 'Local git repository (no README summary)'}"
+                )
+                extracted_count += 1
+
         else:
             # Generic safe file catalog for OpenCode, Devin, Pi/OMP, T3 Code, Windsurf, Cline, etc.
             lines.append("## Detected Local Files & Configs")
@@ -925,7 +1003,7 @@ def parse_web_export_to_markdown(
     output_path: Path,
     *,
     service: str = "auto",
-    max_conversations: int = 80,
+    max_conversations: int = 150,
 ) -> dict[str, Any]:
     """Convert an official ChatGPT, Claude, Gemini, DeepSeek, or T3 JSON/ZIP export into a redacted Markdown digest."""
     resolved = export_path.resolve()
